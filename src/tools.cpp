@@ -1,34 +1,51 @@
 #include "common.hpp"
 #include <cerrno>
-#include <cstring>
+#include <cmath>
 #include <fcntl.h>
+#include <fnmatch.h>
+#include <limits>
 #include <poll.h>
 #include <sstream>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 namespace ca {
 Json tool_schema() {
+    auto property = [](const std::string& type, const std::string& description) {
+        return Json{{"type", type}, {"description", description}};
+    };
     auto tool = [](const std::string& name, const std::string& description, Json properties, Json required) {
         return Json{{"type", "function"}, {"function", {
             {"name", name}, {"description", description}, {"parameters", {
                 {"type", "object"}, {"properties", properties}, {"required", required}, {"additionalProperties", false}}}}}};
     };
     return Json::array({
-        tool("list_files", "List relative paths in this session's project; excludes build outputs.", Json::object(), Json::array()),
-        tool("read_file", "Read numbered lines of a project file. Use relative paths. At most 100 lines / 4096 bytes per call.",
-             {{"path", {{"type", "string"}}}, {"start", {{"type", "integer"}, {"minimum", 1}}},
-              {"count", {{"type", "integer"}, {"minimum", 1}, {"maximum", 100}}}}, Json::array({"path", "start", "count"})),
-        tool("write_file", "Create or replace a complete source file under src/. Content must be raw C++ source, with no markdown fences. Build rules and external tests are read-only.",
-             {{"path", {{"type", "string"}}}, {"content", {{"type", "string"}}}}, Json::array({"path", "content"})),
-        tool("build_and_test", "Run the project's fixed make test command. The default template compiles src/*.cpp and runs build/app --self-test. Returns actual exit code and output. Always use after your last source modification.",
-             Json::object(), Json::array())
+        tool("Read", "Read a text file. Returns numbered lines.",
+             {{"file_path", property("string", "Path to the file to read.")},
+              {"offset", property("integer", "Optional 1-based starting line.")},
+              {"limit", property("integer", "Optional maximum number of lines.")}}, Json::array({"file_path"})),
+        tool("Write", "Write a complete file, creating parent directories when needed.",
+             {{"file_path", property("string", "Path to write.")},
+              {"content", property("string", "Full file contents.")}}, Json::array({"file_path", "content"})),
+        tool("Edit", "Replace an exact string in a text file.",
+             {{"file_path", property("string", "Path to edit.")},
+              {"old_string", property("string", "Exact text to replace.")},
+              {"new_string", property("string", "Replacement text.")},
+              {"replace_all", property("boolean", "Replace every occurrence instead of requiring one match.")}},
+             Json::array({"file_path", "old_string", "new_string"})),
+        tool("Glob", "Find files by glob pattern.",
+             {{"pattern", property("string", "Glob pattern, e.g. **/*.py.")},
+              {"path", property("string", "Optional directory to search from.")}}, Json::array({"pattern"})),
+        tool("Bash", "Run a shell command in the repository workdir.",
+             {{"command", property("string", "Command to run.")},
+              {"description", property("string", "Short description of the command.")},
+              {"timeout", property("number", "Optional timeout in seconds.")}}, Json::array({"command"}))
     });
 }
 void copy_project(const fs::path& source, const fs::path& destination) {
-    if (!fs::is_directory(source) || !fs::is_regular_file(source / "Makefile") || !fs::is_directory(source / "src"))
-        throw std::runtime_error("项目模板需要 Makefile 和 src/ 目录");
+    if (!fs::is_directory(source)) throw std::runtime_error("项目模板必须为目录");
     fs::create_directories(destination);
     std::size_t count = 0, total = 0;
     for (auto it = fs::recursive_directory_iterator(source); it != fs::recursive_directory_iterator(); ++it) {
@@ -47,7 +64,7 @@ void copy_project(const fs::path& source, const fs::path& destination) {
         } else throw std::runtime_error("项目模板只支持普通文件和目录");
     }
 }
-Workspace open_workspace(const fs::path& path, const Config& config) {
+Workspace open_workspace(const fs::path& path) {
     if (path.empty() || path.string().find('\0') != std::string::npos)
         throw std::runtime_error("工作目录不能为空或包含 NUL");
     fs::create_directories(path);
@@ -56,178 +73,262 @@ Workspace open_workspace(const fs::path& path, const Config& config) {
     if (lock.get() < 0) throw std::runtime_error("无法创建工作目录锁");
     if (flock(lock.get(), LOCK_EX | LOCK_NB) < 0)
         throw std::runtime_error("工作目录已被另一个会话使用，请选择其他目录");
-    for (const auto* name : {"Makefile", "README.md"}) {
-        auto target = root / name;
-        if (fs::is_symlink(fs::symlink_status(target))) throw std::runtime_error("工作目录的构建规则和说明不能为符号链接");
-        if (!fs::exists(target)) {
-            auto source = config.project / name;
-            if (fs::is_regular_file(source)) fs::copy_file(source, target);
-            else if (std::string(name) == "README.md") {
-                std::ofstream readme(target);
-                readme << "# C++ project\n\nOnly src/ is writable. Read Makefile for the build contract.\n"
-                          "Run make test after every source change; success requires exit code 0.\n";
-                if (!readme) throw std::runtime_error("创建项目说明失败");
-            } else throw std::runtime_error("项目模板缺少 Makefile");
-        }
-        if (!fs::is_regular_file(target)) throw std::runtime_error(std::string(name) + " 必须为普通文件");
-    }
-    if (fs::is_symlink(fs::symlink_status(root / "src"))) throw std::runtime_error("src/ 不能为符号链接");
-    fs::create_directories(root / "src");
     return {root, std::move(lock)};
 }
 Tools::Tools(fs::path workspace, fs::path logs, int timeout)
     : root_(fs::canonical(workspace)), logs_(std::move(logs)), timeout_(timeout) {}
-fs::path Tools::checked_path(const std::string& value, bool write) const {
+fs::path Tools::checked_path(const std::string& value) const {
     if (value.empty() || value.find('\0') != std::string::npos) throw std::runtime_error("文件路径为空或包含 NUL");
     fs::path path(value);
-    if (path.is_absolute()) throw std::runtime_error("只允许相对文件路径");
-    for (const auto& part : path) if (part == "..") throw std::runtime_error("不允许 .. 路径");
-    path = path.lexically_normal();
-    if (write && (path.begin() == path.end() || *path.begin() != "src" || path == "src"))
-        throw std::runtime_error("只允许修改 src/ 中的文件，构建规则与外部验收测试只读");
+    path = (path.is_absolute() ? path : root_ / path).lexically_normal();
+    auto relative = path.lexically_relative(root_);
+    if (relative.empty() || *relative.begin() == "..") throw std::runtime_error("文件路径超出工作目录");
+    if (relative == ".coding-agent.lock") throw std::runtime_error("工作目录锁由服务端管理");
     auto checked = root_;
-    for (const auto& part : path) {
+    for (const auto& part : relative) {
         checked /= part;
         if (fs::is_symlink(fs::symlink_status(checked))) throw std::runtime_error("不允许访问符号链接");
     }
     return checked;
 }
+static std::string read_text_file(const fs::path& path) {
+    if (!fs::is_regular_file(path) || fs::file_size(path) > frame_limit)
+        throw std::runtime_error("文件不存在、不是普通文件或超过 1 MiB");
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("打开文件失败");
+    std::ostringstream content;
+    content << input.rdbuf();
+    if (input.bad()) throw std::runtime_error("读取文件失败");
+    return content.str();
+}
+void Tools::write_file(const fs::path& path, const std::string& content) const {
+    if (content.size() > 64 * 1024) throw std::runtime_error("文件内容超过 64 KiB");
+    if (fs::exists(path) && !fs::is_regular_file(path)) throw std::runtime_error("目标不是普通文件");
+    fs::create_directories(path.parent_path());
+    auto temp = path.string() + ".tmp-" + std::to_string(getpid());
+    Fd file(open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+    if (file.get() < 0) throw std::runtime_error("创建临时文件失败");
+    try {
+        if (fs::exists(path)) {
+            auto mode = static_cast<mode_t>(fs::status(path).permissions()) & 0777;
+            if (fchmod(file.get(), mode) < 0) throw std::runtime_error("保留文件权限失败");
+        }
+        std::size_t offset = 0;
+        while (offset < content.size()) {
+            auto bytes = write(file.get(), content.data() + offset, content.size() - offset);
+            if (bytes < 0 && errno == EINTR) continue;
+            if (bytes <= 0) throw std::runtime_error("写文件失败");
+            offset += static_cast<std::size_t>(bytes);
+        }
+        if (fsync(file.get()) < 0) throw std::runtime_error("保存文件失败");
+        fs::rename(temp, path);
+    } catch (...) { fs::remove(temp); throw; }
+}
+static std::vector<std::string> path_parts(const fs::path& path) {
+    std::vector<std::string> parts;
+    for (const auto& part : path) if (part != ".") parts.push_back(part.string());
+    return parts;
+}
+static bool glob_matches(const std::vector<std::string>& pattern, const fs::path& path) {
+    auto parts = path_parts(path);
+    std::vector<bool> previous(parts.size() + 1, false);
+    previous[0] = true;
+    for (const auto& part : pattern) {
+        std::vector<bool> next(parts.size() + 1, false);
+        if (part == "**") next[0] = previous[0];
+        for (std::size_t i = 1; i <= parts.size(); ++i)
+            next[i] = part == "**" ? previous[i] || next[i - 1]
+                                  : previous[i - 1] && fnmatch(part.c_str(), parts[i - 1].c_str(), 0) == 0;
+        previous = std::move(next);
+    }
+    return previous.back();
+}
 Json Tools::execute(const std::string& name, const Json& args, const Emit& emit, const Cancel& cancel) {
     try {
         if (cancel()) throw Cancelled("任务取消或超时");
         if (!args.is_object()) throw std::runtime_error("工具参数必须为 JSON 对象");
-        std::vector<std::string> allowed;
-        if (name == "read_file") allowed = {"path", "start", "count"};
-        else if (name == "write_file") allowed = {"path", "content"};
-        else if (name != "list_files" && name != "build_and_test") throw std::runtime_error("未知工具：" + name);
-        for (auto it = args.begin(); it != args.end(); ++it)
-            if (std::find(allowed.begin(), allowed.end(), it.key()) == allowed.end()) throw std::runtime_error("未知参数：" + it.key());
-        if (name == "list_files") {
+        // Validate against the schema advertised to the model, including optional types.
+        auto schemas = tool_schema();
+        auto schema = std::find_if(schemas.begin(), schemas.end(), [&](const Json& tool) {
+            return tool["function"]["name"] == name;
+        });
+        if (schema == schemas.end()) throw std::runtime_error("未知工具：" + name);
+        const auto& parameters = (*schema)["function"]["parameters"];
+        for (const auto& key : parameters["required"])
+            if (!args.contains(key.get<std::string>())) throw std::runtime_error("缺少参数：" + key.get<std::string>());
+        for (auto it = args.begin(); it != args.end(); ++it) {
+            if (!parameters["properties"].contains(it.key())) throw std::runtime_error("未知参数：" + it.key());
+            auto type = parameters["properties"][it.key()]["type"].get<std::string>();
+            bool valid = type == "string" ? it->is_string() : type == "integer" ? it->is_number_integer()
+                       : type == "boolean" ? it->is_boolean() : it->is_number();
+            if (!valid) throw std::runtime_error("参数类型无效：" + it.key());
+        }
+        if (name == "Glob") {
+            auto pattern = args.at("pattern").get<std::string>();
+            if (pattern.empty() || pattern.size() > 4096 || pattern.find('\0') != std::string::npos)
+                throw std::runtime_error("glob pattern 为空、过长或包含 NUL");
+            fs::path glob(pattern);
+            if (glob.is_absolute()) throw std::runtime_error("glob pattern 需相对于搜索目录");
+            for (const auto& part : glob) if (part == "..") throw std::runtime_error("glob pattern 不允许 ..");
+            auto base = checked_path(args.value("path", "."));
+            if (!fs::is_directory(base)) throw std::runtime_error("搜索路径不是目录");
+            auto parts = path_parts(glob);
             Json files = Json::array();
             bool truncated = false;
-            for (auto it = fs::recursive_directory_iterator(root_); it != fs::recursive_directory_iterator(); ++it) {
+            std::size_t bytes = 0;
+            for (auto it = fs::recursive_directory_iterator(base, fs::directory_options::skip_permission_denied);
+                 it != fs::recursive_directory_iterator(); ++it) {
+                if (cancel()) throw Cancelled("文件搜索取消或超时");
                 auto name = it->path().filename();
-                if (name == "build" || name == ".git" || name == ".coding-agent.lock") {
+                if (name == ".git" || name == ".coding-agent.lock") {
                     if (it->is_directory()) it.disable_recursion_pending();
                     continue;
                 }
                 if (it->is_symlink()) continue;
-                if (it.depth() > 8) { it.disable_recursion_pending(); truncated = true; continue; }
-                if (it->is_regular_file()) {
-                    if (files.size() == 100) { truncated = true; break; }
-                    files.push_back(it->path().lexically_relative(root_).generic_string());
+                if (it->is_regular_file() && glob_matches(parts, it->path().lexically_relative(base))) {
+                    auto relative = it->path().lexically_relative(root_).generic_string();
+                    bytes += Json(relative).dump().size() + 1;
+                    if (files.size() == 100 || bytes > 4096) { truncated = true; break; }
+                    files.push_back(relative);
                 }
             }
             std::sort(files.begin(), files.end());
             return {{"ok", true}, {"files", files}, {"truncated", truncated}};
         }
-        if (name == "read_file") {
-            std::string path = args.at("path").get<std::string>();
-            int start = args.at("start").get<int>(), count = args.at("count").get<int>();
-            if (!args["start"].is_number_integer() || !args["count"].is_number_integer() || start < 1 || count < 1 || count > 100)
-                throw std::runtime_error("start 从 1 开始，count 必须为 1 到 100 的整数");
-            auto file = checked_path(path, false);
-            if (!fs::is_regular_file(file) || fs::file_size(file) > frame_limit) throw std::runtime_error("文件不存在、不是普通文件或超过 1 MiB");
-            std::ifstream input(file);
-            if (!input) throw std::runtime_error("打开文件失败");
+        if (name == "Read") {
+            auto path = args.at("file_path").get<std::string>();
+            auto positive_line = [&](const char* key, int fallback) {
+                if (!args.contains(key)) return fallback;
+                if (args[key] < 1 || args[key] > std::numeric_limits<int>::max())
+                    throw std::runtime_error(std::string(key) + " 必须为正整数且不超过 INT_MAX");
+                return args[key].get<int>();
+            };
+            int start = positive_line("offset", 1), count = positive_line("limit", 200);
+            std::istringstream input(read_text_file(checked_path(path)));
             std::string line, text;
             int number = 0, last = start - 1;
-            bool truncated = false;
+            bool truncated = false, line_truncated = false;
             while (std::getline(input, line)) {
                 if (++number < start) continue;
-                if (number >= start + count) { truncated = true; break; }
+                if (static_cast<long long>(number) >= static_cast<long long>(start) + count) { truncated = true; break; }
                 std::string entry = std::to_string(number) + ": " + line + '\n';
-                if (text.size() + entry.size() > 4096) { truncated = true; break; }
+                if (text.size() + entry.size() > 4096) {
+                    truncated = true;
+                    if (text.empty()) {
+                        entry.resize(4096);
+                        text = utf8_prefix(entry);
+                        last = number;
+                        line_truncated = true;
+                    }
+                    break;
+                }
                 text += entry;
                 last = number;
             }
-            return {{"ok", true}, {"path", path}, {"content", text}, {"truncated", truncated}, {"next_start", last + 1}};
+            return {{"ok", true}, {"file_path", path}, {"content", text}, {"truncated", truncated},
+                    {"line_truncated", line_truncated}, {"next_offset", last + 1}};
         }
-        if (name == "write_file") {
-            auto path = checked_path(args.at("path").get<std::string>(), true);
+        if (name == "Write") {
+            auto path = checked_path(args.at("file_path").get<std::string>());
             auto content = args.at("content").get<std::string>();
-            if (content.size() > 64 * 1024) throw std::runtime_error("源文件超过 64 KiB");
-            fs::create_directories(path.parent_path());
-            auto temp = path.string() + ".tmp-" + std::to_string(getpid());
-            Fd file(open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600));
-            if (file.get() < 0) throw std::runtime_error("创建临时文件失败");
-            try {
-                std::size_t offset = 0;
-                while (offset < content.size()) {
-                    auto bytes = write(file.get(), content.data() + offset, content.size() - offset);
-                    if (bytes < 0 && errno == EINTR) continue;
-                    if (bytes <= 0) throw std::runtime_error("写源文件失败");
-                    offset += static_cast<std::size_t>(bytes);
-                }
-                if (fsync(file.get()) < 0) throw std::runtime_error("保存源文件失败");
-                fs::rename(temp, path);
-            } catch (...) { fs::remove(temp); throw; }
-            dirty = true;
-            tests_passed = false;
-            return {{"ok", true}, {"path", args["path"]}, {"bytes", content.size()}};
+            write_file(path, content);
+            return {{"ok", true}, {"file_path", args["file_path"]}, {"bytes", content.size()}};
         }
-        return build(emit, cancel);
+        if (name == "Edit") {
+            auto path = checked_path(args.at("file_path").get<std::string>());
+            auto content = read_text_file(path);
+            auto old_string = args.at("old_string").get<std::string>();
+            auto new_string = args.at("new_string").get<std::string>();
+            if (old_string.empty()) throw std::runtime_error("old_string 不能为空");
+            bool all = args.value("replace_all", false);
+            std::size_t matches = 0, position = 0;
+            while ((position = content.find(old_string, position)) != std::string::npos) {
+                ++matches;
+                position += old_string.size();
+            }
+            if (!matches) throw std::runtime_error("old_string 未匹配任何内容");
+            if (!all && matches != 1) throw std::runtime_error("old_string 匹配多处；请提供唯一内容或设置 replace_all=true");
+            std::string updated;
+            std::size_t begin = 0;
+            while ((position = content.find(old_string, begin)) != std::string::npos) {
+                updated.append(content, begin, position - begin);
+                updated += new_string;
+                if (updated.size() > 64 * 1024) throw std::runtime_error("编辑后的文件超过 64 KiB");
+                begin = position + old_string.size();
+            }
+            updated.append(content, begin, std::string::npos);
+            write_file(path, updated);
+            return {{"ok", true}, {"file_path", args["file_path"]}, {"replacements", matches}, {"bytes", updated.size()}};
+        }
+        return bash(args, emit, cancel);
     } catch (const Cancelled&) { throw; }
       catch (const std::exception& error) { return {{"ok", false}, {"error", error.what()}}; }
 }
-Json Tools::build(const Emit& emit, const Cancel& cancel) {
-    tests_passed = false;
+Json Tools::bash(const Json& args, const Emit& emit, const Cancel& cancel) {
+    auto command = args.at("command").get<std::string>();
+    if (command.empty() || command.find('\0') != std::string::npos) throw std::runtime_error("command 为空或包含 NUL");
+    double seconds = args.value("timeout", static_cast<double>(timeout_));
+    auto now = Clock::now();
+    if (!std::isfinite(seconds) || seconds <= 0 ||
+        seconds >= std::chrono::duration<double>(Clock::time_point::max() - now).count())
+        throw std::runtime_error("timeout 必须为有限的正秒数");
+    auto deadline = now + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(seconds));
     int ends[2];
     if (pipe(ends) < 0) throw std::runtime_error("pipe 失败");
     Fd input(ends[0]), output(ends[1]);
     set_fd_flags(input.get());
     set_fd_flags(output.get(), false);
-    fs::path log = logs_ / ("build-" + std::to_string(++builds_) + ".log");
+    fs::path log = logs_ / ("command-" + std::to_string(++commands_) + ".log");
     std::ofstream full(log, std::ios::binary);
-    if (!full) throw std::runtime_error("创建构建日志失败");
+    if (!full) throw std::runtime_error("创建命令日志失败");
+    Fd null(open("/dev/null", O_RDONLY | O_CLOEXEC));
+    if (null.get() < 0) throw std::runtime_error("打开 /dev/null 失败");
     pid_t child = fork();
-    if (child < 0) throw std::runtime_error("fork 构建进程失败");
+    if (child < 0) throw std::runtime_error("fork 命令进程失败");
     if (child == 0) {
         setpgid(0, 0);
         signal(SIGTERM, SIG_DFL); signal(SIGINT, SIG_DFL); signal(SIGPIPE, SIG_DFL);
-        if (chdir(root_.c_str()) < 0 || dup2(output.get(), STDOUT_FILENO) < 0 || dup2(output.get(), STDERR_FILENO) < 0) _exit(126);
+        if (chdir(root_.c_str()) < 0 || dup2(null.get(), STDIN_FILENO) < 0 ||
+            dup2(output.get(), STDOUT_FILENO) < 0 || dup2(output.get(), STDERR_FILENO) < 0) _exit(126);
         ::close(input.get()); ::close(output.get());
-        // No shell command supplied by the model. The copied Makefile is a trusted fixed entry point.
         setenv("LC_ALL", "C", 1);
-        unsetenv("MAKEFLAGS"); unsetenv("MFLAGS"); unsetenv("MAKEFILES");
-        execlp("make", "make", "--no-print-directory", "test", static_cast<char*>(nullptr));
+        execl("/bin/bash", "bash", "-c", command.c_str(), static_cast<char*>(nullptr));
         _exit(127);
     }
     setpgid(child, child);
     output = Fd();
-    auto deadline = Clock::now() + std::chrono::seconds(timeout_);
     std::string feedback, pending, head, tail;
     bool eof = false, exited = false, timeout = false;
     int status = 0;
     std::size_t total = 0;
     auto cleanup = [&] {
-        // Also stop descendants that outlive make or keep its output pipe open.
+        // Also stop descendants that outlive the shell or keep its output pipe open.
         kill(-child, SIGKILL);
         if (!exited) while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
     };
     try {
         while (!eof || !exited) {
-            if (cancel()) throw Cancelled("构建任务取消或超时");
+            if (cancel()) throw Cancelled("命令任务取消或超时");
             if (Clock::now() >= deadline) { timeout = true; break; }
             pollfd fd{input.get(), POLLIN, 0};
-            if (poll(&fd, 1, 50) < 0 && errno != EINTR) throw std::runtime_error("构建输出 poll 失败");
+            if (poll(&fd, 1, 50) < 0 && errno != EINTR) throw std::runtime_error("命令输出 poll 失败");
             if (fd.revents & (POLLIN | POLLHUP)) {
                 char bytes[2048];
                 ssize_t size = read(input.get(), bytes, sizeof(bytes));
                 if (size > 0) {
                     full.write(bytes, size); full.flush();
-                    if (!full) throw std::runtime_error("写构建日志失败");
+                    if (!full) throw std::runtime_error("写命令日志失败");
                     total += static_cast<std::size_t>(size);
-                    if (total > 4 * frame_limit) throw std::runtime_error("构建输出超过 4 MiB，已停止");
+                    if (total > 4 * frame_limit) throw std::runtime_error("命令输出超过 4 MiB，已停止");
                     if (feedback.size() < 4096) feedback.append(bytes, std::min<std::size_t>(size, 4096 - feedback.size()));
                     if (head.size() < 1900) head.append(bytes, std::min<std::size_t>(size, 1900 - head.size()));
                     tail.append(bytes, size);
                     if (tail.size() > 1900) tail.erase(0, tail.size() - 1900);
                     pending.append(bytes, size);
                     auto text = utf8_prefix(pending);
-                    if (!text.empty()) emit({{"type", "build_output"}, {"text", text}});
+                    if (!text.empty()) emit({{"type", "tool_output"}, {"text", text}});
                 } else if (size == 0) eof = true;
-                else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) throw std::runtime_error("读取构建输出失败");
+                else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) throw std::runtime_error("读取命令输出失败");
             }
             if (!exited) {
                 auto result = waitpid(child, &status, WNOHANG);
@@ -237,14 +338,13 @@ Json Tools::build(const Emit& emit, const Cancel& cancel) {
         }
         cleanup();
         auto tail = utf8_prefix(pending, true);
-        if (!tail.empty()) emit({{"type", "build_output"}, {"text", tail}});
+        if (!tail.empty()) emit({{"type", "tool_output"}, {"text", tail}});
     } catch (...) { cleanup(); throw; }
     int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
-    tests_passed = !timeout && exit_code == 0;
-    if (tests_passed) dirty = false;
+    bool ok = !timeout && exit_code == 0;
     if (total > 4096) feedback = head + "\n... [output truncated; see " + log.filename().string() + "] ...\n" + tail;
-    return {{"ok", tests_passed}, {"exit_code", exit_code}, {"timed_out", timeout},
-            {"tests_passed", tests_passed}, {"output", feedback}, {"output_truncated", total > feedback.size()},
+    return {{"ok", ok}, {"exit_code", exit_code}, {"timed_out", timeout},
+            {"output", feedback}, {"output_truncated", total > 4096},
             {"log_file", log.filename().string()}};
 }
 } // namespace ca

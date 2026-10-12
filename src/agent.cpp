@@ -4,36 +4,16 @@
 
 namespace ca {
 std::string system_prompt() {
-    return R"(You are a small local C++ coding assistant. Answer briefly in Chinese.
-The user owns a tiny project in THIS session's working directory. You have exactly four tools.
-For every coding task, you can use list_files to learn this project's build contract.
-For follow-up edits in the same connection, read only relevant source files; reuse the known build contract.
-If src/ is empty, CREATE a small C++17 program in src/main.cpp from the user's requirements.
-For existing code, read the relevant files and headers before editing. Preserve working features.
-Use read_file with start=1 and count<=100. Paths are relative, e.g. src/main.cpp.
-Only src/ is writable. Put .cpp files directly under src/. Build rules and external tests are read-only.
-The default template compiles all src/*.cpp into build/app and runs build/app --self-test.
-For that template, main(argc, argv) MUST handle --self-test without interactive input:
-test real functions with normal and edge cases, print results, return 0 on success and nonzero on failure.
-Keep generated programs compact, preferably under 80 lines. Use a shared feature function in normal execution and self-tests.
-Use table-driven checks instead of repeating a large block for every test case. Avoid long comments or explanations in tool calls.
-Keep self-tests in src/ and maintain them when adding features. Use build/ for temporary test data.
-Normal execution should perform the requested feature, with usage instructions in the final answer.
-write_file replaces an ENTIRE file with raw source code, not a patch or markdown.
-For code generation or edits, actually call write_file. Merely showing code is not completing a coding task.
-Always call build_and_test AFTER the last edit. If it fails, use its real error output to fix the source and retry.
-Never claim tests passed without a successful build_and_test result after the last edit.
-After your edited code passes build_and_test, stop editing and give a brief final answer.
-Use small focused changes. Prefer one tool at a time. Keep tool arguments and final answers short.
-If the user asks a normal question or to remember something, answer directly; tools are optional.
-Earlier messages and tool results belong only to THIS connection. Don't access other sessions.)";
+    return "You are a software-engineering agent working in a checked-out repository.\n"
+           "Use the available tools to inspect files, make focused edits, and run commands.\n"
+           "Solve the task, validate when practical, then give a brief final answer.";
 }
 void run_session(int socket, const Config &config, const std::string &session_id) {
     // Connection state: one workspace, one history and separate persistent logs.
     auto root = config.sessions / session_id;
     auto workspace = root / "workspace";
     copy_project(config.project, workspace);
-    auto selected_workspace = open_workspace(workspace, config);
+    auto selected_workspace = open_workspace(workspace);
     workspace = selected_workspace.root;
     std::ofstream events(root / "events.jsonl", std::ios::app);
     std::ofstream transcript(root / "history.jsonl", std::ios::app);
@@ -55,7 +35,7 @@ void run_session(int socket, const Config &config, const std::string &session_id
         send_frame(socket, event);
     };
     emit({{"type", "hello"}, {"pid", getpid()}, {"workspace", workspace.string()}, {"model", config.model}, {"logs", root.string()}, {"context", config.context}, {"input_limit", config.input_limit}, {"output_limit", config.output_limit}});
-    Tools tools(workspace, root, config.build_timeout);
+    Tools tools(workspace, root, config.command_timeout);
     std::unique_ptr<ModelClient> model;
     bool capacity_checked = false;
     std::set<std::string> seen_requests;
@@ -76,8 +56,8 @@ void run_session(int socket, const Config &config, const std::string &session_id
                 if (path.empty() || path.find('\0') != std::string::npos || path.size() > 4096)
                     throw std::runtime_error("工作目录为空、过长或包含 NUL");
                 if (fs::weakly_canonical(fs::absolute(path)) != workspace) {
-                    auto next = open_workspace(path, config);
-                    tools = Tools(next.root, root, config.build_timeout);
+                    auto next = open_workspace(path);
+                    tools = Tools(next.root, root, config.command_timeout);
                     workspace = next.root;
                     selected_workspace = std::move(next);
                 }
@@ -110,8 +90,6 @@ void run_session(int socket, const Config &config, const std::string &session_id
         Cancel cancel = [&] { return stopping || peer_closed(socket) || Clock::now() >= deadline; };
         Json pending = Json::array();
         int rounds = 0;
-        bool built = false;
-        bool modified = false;
         bool finished = false;
         std::string state = "failed";
         std::string partial_answer;
@@ -119,11 +97,6 @@ void run_session(int socket, const Config &config, const std::string &session_id
             if (event.value("type", "") == "text_delta")
                 partial_answer += event.value("text", "");
             emit(event);
-        };
-        auto verified_summary = [&] {
-            state = "success";
-            emit({{"type", "text_delta"}, {"source", "server"}, {"text", "代码已修改，编译和测试通过。\n"}});
-            remember({{"role", "assistant"}, {"content", "代码已修改，编译和测试通过。"}});
         };
         try {
             if (!model)
@@ -134,15 +107,13 @@ void run_session(int socket, const Config &config, const std::string &session_id
             }
             // Inner loop: ask the model, execute its tools, then return their results.
             for (; rounds < config.max_rounds; ++rounds) {
-                Json body = {{"model", config.model}, {"messages", history}, {"tools", tool_schema()}, {"tool_choice", modified && built && tools.tests_passed && !tools.dirty ? "none" : "auto"}, {"parallel_tool_calls", false}, {"stream", true}, {"stream_options", {{"include_usage", true}}}, {"max_tokens", config.output_limit}, {"temperature", 0.2}, {"top_p", 0.8}, {"presence_penalty", 0.0}, {"repeat_penalty", 1.0}};
+                Json body = {{"model", config.model}, {"messages", history}, {"tools", tool_schema()},
+                             {"tool_choice", "auto"}, {"parallel_tool_calls", false}, {"stream", true},
+                             {"stream_options", {{"include_usage", true}}}, {"max_tokens", config.output_limit},
+                             {"temperature", 0.2}, {"top_p", 0.8}, {"presence_penalty", 0.0}, {"repeat_penalty", 1.0}};
                 int count = model->count_tokens(body, cancel);
                 emit({{"type", "context_usage"}, {"input_tokens", count}, {"context_tokens", count}, {"context", config.context}, {"input_limit", config.input_limit}, {"round", rounds + 1}});
                 if (count > config.input_limit || count + config.output_limit + 512 > config.context) {
-                    if (modified && built && tools.tests_passed && !tools.dirty) {
-                        verified_summary();
-                        finished = true;
-                        break;
-                    }
                     state = "context_limit";
                     throw std::runtime_error("完整对话超过本槽输入预算，已保留历史；请新建连接继续");
                 }
@@ -161,9 +132,7 @@ void run_session(int socket, const Config &config, const std::string &session_id
                 emit({{"type", "context_usage"}, {"input_tokens", count}, {"context_tokens", used}, {"context", config.context}, {"input_limit", config.input_limit}, {"round", rounds + 1}});
                 if (pending.empty()) {
                     finished = true;
-                    state = (tools.dirty || (built && !tools.tests_passed)) ? "failed" : "success";
-                    if (state == "failed")
-                        emit({{"type", "error"}, {"message", "最后的代码尚未通过编译和测试，本轮未标记成功"}});
+                    state = "success";
                     ++rounds;
                     break;
                 }
@@ -175,16 +144,12 @@ void run_session(int socket, const Config &config, const std::string &session_id
                     try {
                         auto args = Json::parse(function.at("arguments").get<std::string>());
                         emit({{"type", "tool_start"}, {"name", name}, {"args", args}, {"tool_call_id", call.at("id")}});
-                        if (name == "build_and_test")
-                            built = true;
                         Emit tool_emit = [&](const Json &event) {
                             Json detailed = event;
                             detailed["tool_call_id"] = call.at("id");
                             emit(detailed);
                         };
                         result = tools.execute(name, args, tool_emit, cancel);
-                        if (name == "write_file" && result.value("ok", false))
-                            modified = true;
                     } catch (const Json::exception &error) {
                         result = {{"ok", false}, {"error", std::string("工具参数 JSON 无效：") + error.what()}};
                     }
@@ -193,9 +158,7 @@ void run_session(int socket, const Config &config, const std::string &session_id
                     emit({{"type", "tool_result"}, {"name", name}, {"result", result}, {"tool_call_id", call.at("id")}});
                 }
             }
-            if (!finished && modified && built && tools.tests_passed && !tools.dirty) {
-                verified_summary();
-            } else if (!finished) {
+            if (!finished) {
                 state = "limit";
                 emit({{"type", "error"}, {"message", "已达到模型调用次数上限，请检查日志或提出更小的任务"}});
             }
@@ -210,7 +173,7 @@ void run_session(int socket, const Config &config, const std::string &session_id
             if (!peer_closed(socket) && !stopping)
                 emit({{"type", "error"}, {"message", error.what()}});
         }
-        Json done = {{"type", "task_done"}, {"status", state}, {"rounds", rounds}, {"tests_passed", tools.tests_passed}, {"unverified_changes", tools.dirty}};
+        Json done = {{"type", "task_done"}, {"status", state}, {"rounds", rounds}};
         if (peer_closed(socket) || stopping) {
             done["time"] = timestamp();
             done["session_id"] = session_id;

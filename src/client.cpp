@@ -63,7 +63,7 @@ int main(int argc, char **argv) {
                           << "\n代码目录：" << state.workspace << "\n模型：" << state.model
                           << " · 上下文上限：" << state.context << " tokens\n输入 /quit 退出\n"
                           << std::flush;
-            else if (type == "text_delta" || (type == "build_output" && verbose)) {
+            else if (type == "text_delta" || (type == "tool_output" && verbose)) {
                 pending += message.value("text", "");
                 std::cout << utf8_prefix(pending) << std::flush;
             } else if (type == "tool_start") {

@@ -51,10 +51,10 @@ void UiState::apply(const Json &event) {
         entry.name = event.value("name", "");
         entry.args = event.value("args", Json::object());
         entry.running = true;
-        status = entry.name == "build_and_test" ? "编译测试中" : "工具执行中";
+        status = entry.name == "Bash" ? "命令执行中" : "工具执行中";
         entries.push_back(std::move(entry));
         active_tool_ = static_cast<int>(entries.size()) - 1;
-    } else if (type == "build_output" && active_tool_ >= 0) {
+    } else if (type == "tool_output" && active_tool_ >= 0) {
         auto &output = entries[active_tool_].output;
         constexpr std::size_t limit = 128 * 1024;
         if (output.size() < limit) {
@@ -63,7 +63,7 @@ void UiState::apply(const Json &event) {
             text.resize(std::min(text.size(), limit - output.size()));
             output += utf8_prefix(text);
             if (truncated)
-                output += "\n[界面内容已截断，完整输出保存在构建日志]\n";
+                output += "\n[界面内容已截断，完整输出保存在命令日志]\n";
         }
     } else if (type == "tool_result") {
         // Invalid JSON arguments can fail before the server emits tool_start.
@@ -100,8 +100,23 @@ void UiState::toggle(int index) {
 std::string UiState::summary(int index) const {
     const auto &entry = entries.at(index);
     std::string text = (entry.expanded ? "▾ " : "▸ ") + entry.name;
-    if (entry.args.contains("path") && entry.args["path"].is_string())
+    if (entry.args.contains("file_path") && entry.args["file_path"].is_string())
+        text += "  " + entry.args["file_path"].get<std::string>();
+    else if (entry.args.contains("path") && entry.args["path"].is_string())
         text += "  " + entry.args["path"].get<std::string>();
+    if (entry.name == "Glob")
+        text += "  " + entry.args.value("pattern", "");
+    if (entry.name == "Bash") {
+        auto description = entry.args.value("description", entry.args.value("command", ""));
+        std::replace(description.begin(), description.end(), '\n', ' ');
+        if (description.size() > 120) {
+            description.resize(120);
+            description = utf8_prefix(description) + "…";
+        }
+        text += "  " + description;
+        if (entry.result.is_object() && entry.result.contains("exit_code"))
+            text += "  exit=" + std::to_string(entry.result.value("exit_code", -1));
+    }
     if (entry.running)
         return text + "  · 执行中";
     if (entry.result.is_null())
@@ -114,19 +129,19 @@ std::string UiState::summary(int index) const {
         text += "  " + std::to_string(result["files"].size()) + " 个文件";
     if (result.contains("bytes"))
         text += "  " + std::to_string(result["bytes"].get<std::size_t>()) + " B";
-    if (entry.name == "read_file")
+    if (entry.name == "Read")
         text += "  " + std::to_string(result.value("content", "").size()) + " B";
-    if (entry.name == "build_and_test")
-        text += "  exit=" + std::to_string(result.value("exit_code", -1));
+    if (result.contains("replacements"))
+        text += "  " + std::to_string(result["replacements"].get<std::size_t>()) + " 处替换";
     return text;
 }
 std::string UiState::details(int index) const {
     const auto &entry = entries.at(index);
     std::string text = "参数 JSON\n" + entry.args.dump(2, ' ', false, Json::error_handler_t::replace);
     if (entry.args.contains("content") && entry.args["content"].is_string())
-        text += "\n源码\n" + entry.args["content"].get<std::string>();
+        text += "\n文件内容\n" + entry.args["content"].get<std::string>();
     if (!entry.output.empty())
-        text += "\n构建输出\n" + entry.output;
+        text += "\n命令输出\n" + entry.output;
     if (!entry.result.is_null())
         text += "\n结果 JSON\n" + entry.result.dump(2, ' ', false, Json::error_handler_t::replace);
     return text;

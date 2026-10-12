@@ -147,67 +147,70 @@ static void ui_tests() {
     ui.apply({{"type", "context_usage"}, {"context_tokens", 1234}, {"input_tokens", 1200}, {"context", 8192}});
     check(ui.tokens == 1234 && ui.context == 8192, "footer uses full measured context count");
     const std::string source = "// 完整源码\nint main() { return 0; }\n";
-    ui.apply({{"type", "tool_start"}, {"name", "write_file"}, {"args", {{"path", "src/main.cpp"}, {"content", source}}}});
+    ui.apply({{"type", "tool_start"}, {"name", "Write"}, {"args", {{"file_path", "src/main.cpp"}, {"content", source}}}});
     int write = static_cast<int>(ui.entries.size()) - 1;
     check(!ui.entries[write].expanded && ui.summary(write).find("src/main.cpp") != std::string::npos &&
           ui.summary(write).find("int main") == std::string::npos, "source hidden in concise tool card");
     ui.toggle(write);
     check(ui.entries[write].expanded && ui.details(write).find(source) != std::string::npos, "expansion preserves complete source");
     ui.apply({{"type", "tool_result"}, {"result", {{"ok", true}, {"bytes", source.size()}}}});
-    ui.apply({{"type", "tool_start"}, {"name", "build_and_test"}, {"args", Json::object()}});
+    ui.apply({{"type", "tool_start"}, {"name", "Bash"}, {"args", {{"command", "make test"}, {"description", "运行自测"}}}});
     int build = static_cast<int>(ui.entries.size()) - 1;
-    ui.apply({{"type", "build_output"}, {"text", "compiler error in main.cpp\n"}});
+    ui.apply({{"type", "tool_output"}, {"text", "compiler error in main.cpp\n"}});
     ui.apply({{"type", "tool_result"}, {"result", {{"ok", false}, {"exit_code", 2}}}});
     check(!ui.entries[build].expanded && ui.summary(build).find("失败") != std::string::npos &&
+          ui.summary(build).find("运行自测") != std::string::npos && ui.summary(build).find("exit=2") != std::string::npos &&
           ui.details(build).find("compiler error") != std::string::npos && ui.details(write).find("compiler error") == std::string::npos,
           "failed build output stays attached to its collapsed card");
-    ui.apply({{"type", "tool_start"}, {"name", "read_file"}, {"args", {{"path", "src/main.cpp"}}}});
+    ui.apply({{"type", "tool_start"}, {"name", "Read"}, {"args", {{"file_path", "src/main.cpp"}}}});
     ui.apply({{"type", "task_done"}, {"status", "cancelled"}});
     check(!ui.busy && ui.summary(static_cast<int>(ui.entries.size()) - 1).find("已中止") != std::string::npos,
           "interrupted tool has a readable terminal state without a result");
     double elapsed = ui.elapsed_seconds();
     usleep(10000);
     check(ui.elapsed_seconds() == elapsed, "completed elapsed time stops advancing");
-    ui.apply({{"type", "tool_result"}, {"name", "write_file"}, {"result", {{"ok", false}, {"error", "invalid argument JSON"}}}});
+    ui.apply({{"type", "tool_result"}, {"name", "Write"}, {"result", {{"ok", false}, {"error", "invalid argument JSON"}}}});
     int invalid = static_cast<int>(ui.entries.size()) - 1;
     check(ui.summary(invalid).find("失败") != std::string::npos && ui.details(invalid).find("invalid argument JSON") != std::string::npos,
           "argument parsing failure is visible even without a tool_start event");
     Json full_result{{"ok", true}, {"content", "第一行\n最后一行"}, {"output", "完整输出"},
                      {"nested", {{"value", "KEEP_NESTED_FIELD"}}}};
-    ui.apply({{"type", "tool_result"}, {"name", "read_file"}, {"result", full_result}});
+    ui.apply({{"type", "tool_result"}, {"name", "Read"}, {"result", full_result}});
     auto details = ui.details(static_cast<int>(ui.entries.size()) - 1);
     check(details.find(full_result.dump(2)) != std::string::npos && ui.details(write).find(ui.entries[write].args.dump(2)) != std::string::npos,
           "expanded JSON retains every argument/result field, including content, output and nested data");
     std::cout << "PASS measured UI metadata, collapsed source/output cards, expansion, interrupted tools\n";
 }
 static void workspace_tests(const fs::path& temp) {
-    Config config;
     auto directory = temp / "direct workspace";
     fs::create_directories(directory / "src");
     std::ofstream(directory / "Makefile") << "test:\n\t@echo custom\n";
     std::ofstream(directory / "README.md") << "Keep my own instructions.\n";
     std::ofstream(directory / "src/keep.hpp") << "// existing file\n";
     {
-        auto workspace = open_workspace(directory, config);
+        auto workspace = open_workspace(directory);
         check(workspace.root == fs::canonical(directory) && read_text(directory / "Makefile").find("custom") != std::string::npos &&
               read_text(directory / "README.md") == "Keep my own instructions.\n" && read_text(directory / "src/keep.hpp") == "// existing file\n",
               "selected directory is used directly without overwriting existing files");
         bool rejected = false;
-        try { auto conflict = open_workspace(directory, config); } catch (const std::exception&) { rejected = true; }
+        try { auto conflict = open_workspace(directory); } catch (const std::exception&) { rejected = true; }
         check(rejected, "same workspace cannot be edited by two active sessions");
-        auto other = open_workspace(temp / "another workspace", config);
+        auto other = open_workspace(temp / "another workspace");
+        check(!fs::exists(other.root / "Makefile") && !fs::exists(other.root / "src") &&
+              !fs::exists(other.root / "README.md"), "selected workspaces do not inject a C++ template");
         Tools tools(workspace.root, temp, 5);
-        auto listing = tools.execute("list_files", Json::object(), [](const Json&) {}, [] { return false; });
+        auto listing = tools.execute("Glob", {{"pattern", "**/*"}}, [](const Json&) {}, [] { return false; });
         check(listing.dump().find(".coding-agent.lock") == std::string::npos, "workspace lock not exposed as a project file");
     }
-    auto reopened = open_workspace(directory, config);
+    auto reopened = open_workspace(directory);
     auto custom = temp / "custom template";
-    fs::create_directories(custom / "src");
-    std::ofstream(custom / "Makefile") << "test:\n\t@echo custom\n";
-    config.project = custom;
-    auto minimal = open_workspace(temp / "custom target", config);
-    check(fs::is_regular_file(minimal.root / "README.md"), "custom template without README remains supported");
-    std::cout << "PASS direct workspaces, existing file preservation, concurrent locks, template initialization\n";
+    fs::create_directories(custom);
+    std::ofstream(custom / "main.py") << "print('custom')\n";
+    copy_project(custom, temp / "custom target");
+    auto minimal = open_workspace(temp / "custom target");
+    check(read_text(minimal.root / "main.py") == "print('custom')\n" && !fs::exists(minimal.root / "Makefile"),
+          "templates support projects without C++ build rules");
+    std::cout << "PASS direct workspaces, existing file preservation, concurrent locks, generic templates\n";
 }
 static void tui_terminal_tests(const std::string& binary, const fs::path& temp) {
     auto listener = listen_tcp("127.0.0.1", 0);
@@ -301,12 +304,12 @@ static void tui_terminal_tests(const std::string& binary, const fs::path& temp) 
     auto event = [&](Json value) { value["request_id"] = id; send_frame(connection.get(), value); };
     event({{"type", "context_usage"}, {"context_tokens", 1234}, {"context", 8192}});
     event({{"type", "text_delta"}, {"text", "CHAT_STREAM_ONE"}});
-    event({{"type", "tool_start"}, {"name", "write_file"}, {"args", {{"path", "src/main.cpp"}, {"content", "CODE_MARKER_4862\nint main() {}"}}}});
+    event({{"type", "tool_start"}, {"name", "Write"}, {"args", {{"file_path", "src/main.cpp"}, {"content", "CODE_MARKER_4862\nint main() {}"}}}});
     event({{"type", "tool_result"}, {"result", {{"ok", true}, {"bytes", 40}}}});
     event({{"type", "text_delta"}, {"text", "CHAT_STREAM_TWO"}});
-    event({{"type", "tool_start"}, {"name", "build_and_test"}, {"args", Json::object()}});
-    event({{"type", "build_output"}, {"text", "BUILD_MARKER_9217\n"}});
-    check(capture([&] { return screen.find("build_and_test") != std::string::npos; }), "streamed text and tool cards render before task completion");
+    event({{"type", "tool_start"}, {"name", "Bash"}, {"args", {{"command", "make test"}}}});
+    event({{"type", "tool_output"}, {"text", "BUILD_MARKER_9217\n"}});
+    check(capture([&] { return screen.find("Bash") != std::string::npos; }), "streamed text and tool cards render before task completion");
     check(screen.find("CODE_MARKER_4862") == std::string::npos && screen.find("BUILD_MARKER_9217") == std::string::npos,
           "default collapsed cards do not print full source or build output");
     keys("\t\n");
@@ -321,7 +324,7 @@ static void tui_terminal_tests(const std::string& binary, const fs::path& temp) 
     check(capture([&] { return screen.find("结束后再发送") != std::string::npos; }), "input stays responsive and preserves a draft during generation");
     pollfd pending{connection.get(), POLLIN, 0};
     check(poll(&pending, 1, 100) == 0, "busy client does not queue another task into current request");
-    event({{"type", "build_output"}, {"text", "BUILD_STREAM_UPDATE\n"}});
+    event({{"type", "tool_output"}, {"text", "BUILD_STREAM_UPDATE\n"}});
     event({{"type", "tool_result"}, {"result", {{"ok", true}, {"exit_code", 0}}}});
     event({{"type", "task_done"}, {"status", "success"}});
     check(capture([&] { return screen.find("BUILD_STREAM_UPDATE") != std::string::npos; }), "expanded build details update as more output arrives");
@@ -335,7 +338,7 @@ static void tui_terminal_tests(const std::string& binary, const fs::path& temp) 
     question = submitted();
     check(question && question->at("text") == "下一轮草稿", "saved draft can be sent after task finishes");
     id = question->at("request_id");
-    event({{"type", "tool_start"}, {"name", "read_file"}, {"args", {{"path", "src/main.cpp"}}}});
+    event({{"type", "tool_start"}, {"name", "Read"}, {"args", {{"file_path", "src/main.cpp"}}}});
     event({{"type", "error"}, {"message", "INTERRUPTED_TOOL"}});
     event({{"type", "task_done"}, {"status", "failed"}});
     check(capture([&] { return screen.find("已中止") != std::string::npos; }), "interrupted tool with no result remains renderable");
@@ -358,14 +361,14 @@ static void tui_terminal_tests(const std::string& binary, const fs::path& temp) 
     Json files = Json::array();
     for (int i = 0; i < 80; ++i) files.push_back("src/file_" + std::to_string(i) + ".cpp");
     files.push_back("JSON_TAIL_MARKER_6392");
-    event({{"type", "tool_start"}, {"name", "list_files"}, {"args", Json::object()}});
+    event({{"type", "tool_start"}, {"name", "Glob"}, {"args", {{"pattern", "**/*"}}}});
     event({{"type", "tool_result"}, {"result", {{"ok", true}, {"files", files}, {"truncated", false},
                                                 {"content", "KEEP_CONTENT_FIELD"}, {"output", "KEEP_OUTPUT_FIELD"}}}});
     event({{"type", "task_done"}, {"status", "success"}});
-    check(capture([&] { return screen.find("list_files") != std::string::npos; }), "new tool is rendered before keyboard selection");
+    check(capture([&] { return screen.find("Glob") != std::string::npos; }), "new tool is rendered before keyboard selection");
     screen.clear();
     keys("\t\n");
-    check(capture([&] { return screen.find("参数 JSON") != std::string::npos || screen.find("▾ list_files") != std::string::npos; }),
+    check(capture([&] { return screen.find("参数 JSON") != std::string::npos || screen.find("▾ Glob") != std::string::npos; }),
           "long tool result expands without forcing its tail into view");
     check(screen.find("JSON_TAIL_MARKER_6392") == std::string::npos, "long result tail initially lies below viewport");
     wheel(65, false);
@@ -454,60 +457,123 @@ static const std::string extended_source = [] {
 static void tool_tests(const fs::path& temp) {
     auto project = temp / "tools";
     copy_project(fs::path(AGENT_PROJECT_DIR) / "templates/cpp", project);
-    Tools tools(project, temp, 10);
+    Tools tools(project, temp / "tool-logs", 10);
+    fs::create_directories(temp / "tool-logs");
     auto emit = [](const Json&) {};
     auto cancel = [] { return false; };
+    auto run = [&](const std::string& command) {
+        return tools.execute("Bash", {{"command", command}}, emit, cancel);
+    };
     for (const auto& path : {"../secret", "/etc/passwd", "src/../../secret"})
-        check(!tools.execute("read_file", {{"path", path}, {"start", 1}, {"count", 100}}, emit, cancel)["ok"], "path rejected");
+        check(!tools.execute("Read", {{"file_path", path}}, emit, cancel)["ok"], "outside path rejected");
     fs::create_symlink(temp, project / "src/link");
-    check(!tools.execute("write_file", {{"path", "src/link/outside.cpp"}, {"content", "oops"}}, emit, cancel)["ok"], "symlink write rejected");
-    check(!tools.execute("write_file", {{"path", "Makefile"}, {"content", "oops"}}, emit, cancel)["ok"], "build rules protected");
-    check(!tools.execute("write_file", {{"path", "tests/test.cpp"}, {"content", "oops"}}, emit, cancel)["ok"], "external tests protected");
-    check(!tools.execute("read_file", {{"path", "README.md"}, {"start", -1}, {"count", 5}}, emit, cancel)["ok"], "bad line range");
-    check(!tools.execute("list_files", {{"unexpected", 1}}, emit, cancel)["ok"], "unexpected argument rejected");
-    auto failed = tools.execute("build_and_test", Json::object(), emit, cancel);
-    check(!failed["ok"] && failed["exit_code"] != 0 && !tools.tests_passed, "empty project cannot pretend to build");
-    auto failing = tools.execute("write_file", {{"path", "src/main.cpp"},
+    check(!tools.execute("Write", {{"file_path", "src/link/outside.cpp"}, {"content", "oops"}}, emit, cancel)["ok"],
+          "symlink write rejected");
+    check(!tools.execute("Write", {{"file_path", ".coding-agent.lock"}, {"content", "oops"}}, emit, cancel)["ok"],
+          "workspace lock cannot be replaced by a file tool");
+    check(!tools.execute("Read", {{"file_path", "README.md"}, {"offset", -1}}, emit, cancel)["ok"] &&
+          !tools.execute("Read", {{"file_path", "README.md"}, {"limit", 1.5}}, emit, cancel)["ok"] &&
+          !tools.execute("Read", {{"file_path", "README.md"}, {"offset", 4294967297ULL}}, emit, cancel)["ok"], "bad line ranges rejected");
+    check(!tools.execute("Glob", {{"pattern", "**/*"}, {"unexpected", 1}}, emit, cancel)["ok"] &&
+          !tools.execute("Write", {{"file_path", "missing.txt"}}, emit, cancel)["ok"] &&
+          !tools.execute("Read", {{"file_path", 123}}, emit, cancel)["ok"], "invalid arguments rejected");
+    check(tools.execute("Write", {{"file_path", "tests/data/example.txt"}, {"content", "one\ntwo\none\n"}}, emit, cancel)["ok"],
+          "Write creates directories and files outside src");
+    auto read = tools.execute("Read", {{"file_path", "tests/data/example.txt"}}, emit, cancel);
+    check(read["ok"] && read["content"] == "1: one\n2: two\n3: one\n" && !read["truncated"], "Read optional defaults and line numbers");
+    read = tools.execute("Read", {{"file_path", (fs::canonical(project) / "tests/data/example.txt").string()},
+                                 {"offset", 2}, {"limit", 1}}, emit, cancel);
+    check(read["ok"] && read["content"] == "2: two\n" && read["next_offset"] == 3 && read["truncated"],
+          "Read accepts workspace absolute paths and explicit pagination");
+    read = tools.execute("Read", {{"file_path", "tests/data/example.txt"}, {"offset", 99}}, emit, cancel);
+    check(read["ok"] && read["content"] == "" && !read["truncated"], "Read past EOF returns no lines");
+    auto original = read_text(project / "tests/data/example.txt");
+    for (const auto& old : {"one", "missing", ""})
+        check(!tools.execute("Edit", {{"file_path", "tests/data/example.txt"}, {"old_string", old}, {"new_string", "changed"}}, emit, cancel)["ok"] &&
+              read_text(project / "tests/data/example.txt") == original, "ambiguous or absent Edit leaves the file intact");
+    auto edit = tools.execute("Edit", {{"file_path", "tests/data/example.txt"}, {"old_string", "two\n"},
+                                       {"new_string", "second\n"}}, emit, cancel);
+    check(edit["ok"] && edit["replacements"] == 1 && read_text(project / "tests/data/example.txt") == "one\nsecond\none\n",
+          "Edit replaces a unique multiline literal");
+    edit = tools.execute("Edit", {{"file_path", "tests/data/example.txt"}, {"old_string", "one"},
+                                  {"new_string", "one+one"}, {"replace_all", true}}, emit, cancel);
+    check(edit["ok"] && edit["replacements"] == 2 && read_text(project / "tests/data/example.txt") == "one+one\nsecond\none+one\n",
+          "replace_all replaces original nonoverlapping matches without revisiting inserted content");
+    check(!tools.execute("Edit", {{"file_path", "tests/data/example.txt"}, {"old_string", "second"},
+                                   {"new_string", ""}, {"replace_all", "true"}}, emit, cancel)["ok"], "replace_all requires a boolean");
+    check(tools.execute("Write", {{"file_path", "empty.txt"}, {"content", ""}}, emit, cancel)["ok"] &&
+          tools.execute("Read", {{"file_path", "empty.txt"}}, emit, cancel)["content"] == "", "empty files can be written and read");
+    tools.execute("Write", {{"file_path", "script.sh"}, {"content", "#!/bin/bash\necho before\n"}}, emit, cancel);
+    fs::permissions(project / "script.sh", fs::perms::owner_exec, fs::perm_options::add);
+    edit = tools.execute("Edit", {{"file_path", "script.sh"}, {"old_string", "before"}, {"new_string", "after"}}, emit, cancel);
+    check(edit["ok"] && run("./script.sh")["output"] == "after\n", "atomic editing preserves executable permission");
+    check(tools.execute("Write", {{"file_path", "root.py"}, {"content", "pass\n"}}, emit, cancel)["ok"] &&
+          tools.execute("Write", {{"file_path", "pkg/deep/test.py"}, {"content", "pass\n"}}, emit, cancel)["ok"], "generic source files can be written");
+    auto glob = tools.execute("Glob", {{"pattern", "**/*.py"}}, emit, cancel);
+    check(glob["ok"] && glob["files"] == Json::array({"pkg/deep/test.py", "root.py"}), "globstar includes root and nested files, with sorted results");
+    glob = tools.execute("Glob", {{"pattern", "*.py"}}, emit, cancel);
+    check(glob["files"] == Json::array({"root.py"}), "single star does not cross directory separators");
+    glob = tools.execute("Glob", {{"pattern", "**/t?st.[p]y"}, {"path", (fs::canonical(project) / "pkg").string()}}, emit, cancel);
+    check(glob["ok"] && glob["files"] == Json::array({"pkg/deep/test.py"}), "Glob optional path and shell wildcards");
+    check(tools.execute("Glob", {{"pattern", "**/*.absent"}}, emit, cancel)["files"].empty() &&
+          !tools.execute("Glob", {{"pattern", "**/*"}, {"path", ".."}}, emit, cancel)["ok"], "glob misses are empty and outside directories rejected");
+    auto result = run("printf 'stdout\\n'; printf 'stderr\\n' >&2; exit 7");
+    check(!result["ok"] && result["exit_code"] == 7 && result["output"] == "stdout\nstderr\n" && !result["timed_out"],
+          "Bash captures both output streams and actual failure exit code");
+    result = run("pwd; read value || printf 'stdin is EOF\\n'");
+    check(result["ok"] && result["output"] == fs::canonical(project).string() + "\nstdin is EOF\n", "Bash runs in workspace with noninteractive stdin");
+    check(!tools.execute("Bash", {{"command", "true"}, {"timeout", 0}}, emit, cancel)["ok"] &&
+          !tools.execute("Bash", {{"command", "true"}, {"timeout", "1"}}, emit, cancel)["ok"], "invalid timeouts rejected");
+    auto failed = run("make --no-print-directory test");
+    check(!failed["ok"] && failed["exit_code"] != 0, "empty project cannot pretend to build");
+    auto failing = tools.execute("Write", {{"file_path", "src/main.cpp"},
         {"content", "#include <iostream>\nint main() { std::cout << \"FAIL generated check\\n\"; return 1; }\n"}}, emit, cancel);
     check(failing["ok"], "create source in initially empty project");
-    failed = tools.execute("build_and_test", Json::object(), emit, cancel);
-    check(!failed["ok"] && failed["exit_code"] != 0 && !tools.tests_passed &&
+    failed = run("make --no-print-directory test");
+    check(!failed["ok"] && failed["exit_code"] != 0 &&
           failed["output"].get<std::string>().find("FAIL generated check") != std::string::npos, "real generated self-test failure");
-    auto write = tools.execute("write_file", {{"path", "src/main.cpp"}, {"content", good_source}}, emit, cancel);
-    check(write["ok"] && tools.dirty && !tools.tests_passed, "write marks unverified");
-    auto passed = tools.execute("build_and_test", Json::object(), emit, cancel);
-    check(passed["ok"] && tools.tests_passed && !tools.dirty, "actual generated code compiles and self-tests pass");
+    auto write = tools.execute("Write", {{"file_path", "src/main.cpp"}, {"content", good_source}}, emit, cancel);
+    check(write["ok"], "source can be rewritten after failure");
+    auto passed = run("make --no-print-directory test");
+    check(passed["ok"] && passed["exit_code"] == 0, "actual generated code compiles and self-tests pass via Bash");
     check(passed["output"].get<std::string>().find("PASS ascending with duplicates") != std::string::npos, "real feature test executed");
     check(read_text(project / "build/self-test.txt") == "generated program", "generated program reads and writes a real file");
-    auto extra = tools.execute("write_file", {{"path", "src/helper.cpp"}, {"content", "int helper() { return 7; }\n"}}, emit, cancel);
-    check(extra["ok"] && tools.dirty, "additional source file created");
-    passed = tools.execute("build_and_test", Json::object(), emit, cancel);
+    auto extra = tools.execute("Write", {{"file_path", "src/helper.cpp"}, {"content", "int helper() { return 7; }\n"}}, emit, cancel);
+    check(extra["ok"], "additional source file created");
+    passed = run("make --no-print-directory test");
     check(passed["ok"] && passed["output"].get<std::string>().find("src/helper.cpp") != std::string::npos, "all generated source files compiled");
-    tools.execute("write_file", {{"path", "src/main.cpp"}, {"content", "this is not C++"}}, emit, cancel);
-    check(!tools.tests_passed && tools.dirty, "new edit invalidates old test result");
-    auto bad = tools.execute("build_and_test", Json::object(), emit, cancel);
+    check(tools.execute("Edit", {{"file_path", "Makefile"}, {"old_string", "CXX = c++"}, {"new_string", "CXX = c++\n# editable build rule"}}, emit, cancel)["ok"],
+          "build rules are editable");
+    tools.execute("Write", {{"file_path", "src/main.cpp"}, {"content", "this is not C++"}}, emit, cancel);
+    auto bad = run("make --no-print-directory test");
     check(!bad["ok"] && bad["exit_code"] != 0, "actual compilation error");
-    auto slow = temp / "slow";
-    fs::create_directories(slow / "src");
-    std::ofstream(slow / "Makefile") << "test:\n\t@echo waiting; sleep 30\n";
-    Tools timeout(slow, temp, 1);
+    Tools timeout(project, temp / "timeout-logs", 1);
+    fs::create_directories(temp / "timeout-logs");
     auto start = Clock::now();
-    auto timed = timeout.execute("build_and_test", Json::object(), emit, cancel);
-    check(timed["timed_out"] && !timed["ok"] && Clock::now() - start < std::chrono::seconds(4), "build timeout enforced");
-    Tools interrupted(slow, temp, 10);
+    auto timed = timeout.execute("Bash", {{"command", "sleep 30"}}, emit, cancel);
+    check(timed["timed_out"] && !timed["ok"] && Clock::now() - start < std::chrono::seconds(4), "default command timeout enforced");
+    start = Clock::now();
+    timed = tools.execute("Bash", {{"command", "sleep 30"}, {"timeout", 0.15}}, emit, cancel);
+    check(timed["timed_out"] && !timed["ok"] && Clock::now() - start < std::chrono::seconds(2), "fractional per-call timeout overrides default");
+    start = Clock::now();
     bool cancelled = false;
     try {
-        interrupted.execute("build_and_test", Json::object(), emit,
-                            [&] { return Clock::now() - start > std::chrono::milliseconds(1200); });
+        tools.execute("Bash", {{"command", "sleep 30"}}, emit,
+                      [&] { return Clock::now() - start > std::chrono::milliseconds(150); });
     } catch (const Cancelled&) { cancelled = true; }
-    check(cancelled, "build cancellation propagated");
-    std::ofstream(slow / "Makefile") << "test:\n\t@echo HEAD; yes padding1234567890 | head -n 1000; echo TAIL_ERROR; exit 1\n";
-    Tools clipped(slow, temp, 5);
-    auto large = clipped.execute("build_and_test", Json::object(), emit, cancel);
+    check(cancelled, "command cancellation propagated");
+    std::string streamed;
+    auto large = tools.execute("Bash", {{"command", "echo HEAD; yes padding1234567890 | head -n 1000; echo TAIL_ERROR; exit 1"}},
+                              [&](const Json& event) {
+                                  check(event["type"] == "tool_output", "generic command output event");
+                                  streamed += event["text"].get<std::string>();
+                              }, cancel);
     auto feedback = large["output"].get<std::string>();
     check(large["output_truncated"] && feedback.size() <= 4096 && feedback.find("HEAD") != std::string::npos &&
-          feedback.find("TAIL_ERROR") != std::string::npos, "clipped output preserves beginning and error at the end");
-    std::cout << "PASS file boundaries, atomic writes, real builds/tests, timeout, cancellation\n";
+          feedback.find("TAIL_ERROR") != std::string::npos &&
+          read_text(temp / "tool-logs" / large["log_file"].get<std::string>()) == streamed,
+          "clipped feedback preserves head and tail, with complete streamed output and command log");
+    std::cout << "PASS Read/Write/Edit/Glob/Bash, file boundaries, atomic writes, real builds/tests, timeout, cancellation\n";
 }
 struct HttpRequest { std::string path; Json body; };
 static HttpRequest read_http(int fd) {
@@ -576,20 +642,35 @@ static void mock_connection(int fd, const fs::path& logs) {
         json_response(fd, {{"input_tokens", prompt == "COUNT_OVER" || (prompt == "GENERATE_OVER_COUNT" && completed >= 3) ? 9000 : 512}});
         return;
     }
+    check(request.body.value("tool_choice", "") == "auto", "model remains free to call tools after successful commands");
     std::ofstream(logs / (std::to_string(getpid()) + ".json")) << request.body.dump();
     raw_send(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
     int tools = 0;
     for (std::size_t i = last_user + 1; i < messages.size(); ++i) if (messages[i].value("role", "") == "tool") ++tools;
-    if (prompt == "GENERATE" || prompt == "GENERATE_OVER_COUNT" || prompt == "EXTEND") {
-        if (tools == 0) tool_reply(fd, "read_file", {{"path", prompt == "EXTEND" ? "src/main.cpp" : "README.md"}, {"start", 1}, {"count", 100}});
-        else if (tools == 1) tool_reply(fd, "write_file", {{"path", "src/main.cpp"}, {"content", prompt == "EXTEND" ? extended_source : good_source}});
-        else if (tools == 2) tool_reply(fd, "build_and_test", Json::object());
+    if (prompt == "GENERATE" || prompt == "GENERATE_OVER_COUNT" || prompt == "EXTEND" || prompt == "KEEP_EDITING") {
+        if (tools == 0) tool_reply(fd, "Read", {{"file_path", prompt == "EXTEND" ? "src/main.cpp" : "README.md"}});
+        else if (tools == 1 && prompt == "EXTEND")
+            tool_reply(fd, "Edit", {{"file_path", "src/main.cpp"}, {"old_string", good_source}, {"new_string", extended_source}});
+        else if (tools == 1) tool_reply(fd, "Write", {{"file_path", "src/main.cpp"}, {"content", good_source}});
+        else if (tools == 2 || (prompt == "KEEP_EDITING" && tools == 4))
+            tool_reply(fd, "Bash", {{"command", "make --no-print-directory test"}, {"description", "编译并运行自测"}});
+        else if (prompt == "KEEP_EDITING" && tools == 3)
+            tool_reply(fd, "Edit", {{"file_path", "src/main.cpp"}, {"old_string", "std::sort("}, {"new_string", "std::stable_sort("}});
         else text_reply(fd, "已修复并通过测试。", 3, 10000);
+    } else if (prompt == "GENERIC") {
+        if (tools == 0) tool_reply(fd, "Glob", {{"pattern", "**/*"}});
+        else if (tools == 1) tool_reply(fd, "Write", {{"file_path", "main.sh"}, {"content", "printf 'generic shell\\n'\n"}});
+        else if (tools == 2 || tools == 4) tool_reply(fd, "Bash", {{"command", "bash main.sh"}});
+        else if (tools == 3) tool_reply(fd, "Edit", {{"file_path", "main.sh"}, {"old_string", "generic shell"}, {"new_string", "updated shell"}});
+        else text_reply(fd, "通用目录任务完成。");
     } else if (prompt == "UNVERIFIED") {
-        if (!tools) tool_reply(fd, "write_file", {{"path", "src/main.cpp"}, {"content", good_source}});
-        else text_reply(fd, "我声称已完成，但没有运行测试。");
-    } else if (prompt == "TRUNCATED") tool_reply(fd, "write_file", {{"path", "src/main.cpp"}, {"content", good_source}}, true);
-    else if (prompt == "LOOP") tool_reply(fd, "list_files", Json::object());
+        if (!tools) tool_reply(fd, "Write", {{"file_path", "src/main.cpp"}, {"content", good_source}});
+        else text_reply(fd, "已写入文件，未运行测试。");
+    } else if (prompt == "FAILED_COMMAND") {
+        if (!tools) tool_reply(fd, "Bash", {{"command", "printf 'command failed\\n'; exit 5"}});
+        else text_reply(fd, "命令退出码为 5。");
+    } else if (prompt == "TRUNCATED") tool_reply(fd, "Write", {{"file_path", "src/main.cpp"}, {"content", good_source}}, true);
+    else if (prompt == "LOOP") tool_reply(fd, "Glob", {{"pattern", "**/*"}});
     else if (prompt == "RECALL") {
         std::string marker = "missing";
         for (std::size_t i = 0; i < last_user; ++i) if (messages[i].value("role", "") == "user") {
@@ -681,13 +762,14 @@ static void integration_tests(const std::string& binary, const fs::path& root) {
     {
         Connection direct(port), another(port);
         auto directory = root / "chosen project";
+        copy_project(fs::path(AGENT_PROJECT_DIR) / "templates/cpp", directory);
         check(direct.configure(directory)["type"] == "workspace_ready", "client can select a direct work directory");
         check(another.configure(directory)["type"] == "workspace_error", "concurrent client rejected for same work directory");
         check(another.configure(root / "other chosen project")["type"] == "workspace_ready", "other client can select its own directory");
         direct.ask("GENERATE"); auto generated = direct.collect();
         check(generated.back()["status"] == "success" && read_text(directory / "src/main.cpp") == good_source &&
               !fs::exists(fs::path(direct.hello["workspace"].get<std::string>()) / "src/main.cpp"), "generated source lands directly in selected directory");
-        check(fs::exists(fs::path(direct.hello["logs"].get<std::string>()) / "build-1.log"), "selected directory keeps session-specific logs separate");
+        check(fs::exists(fs::path(direct.hello["logs"].get<std::string>()) / "command-1.log"), "selected directory keeps session-specific logs separate");
         check(direct.configure(root / "too late")["type"] == "workspace_error", "directory cannot change after a task starts");
         auto pid = direct.hello["pid"].get<pid_t>();
         direct.socket = Fd();
@@ -695,6 +777,20 @@ static void integration_tests(const std::string& binary, const fs::path& root) {
         Connection reopened(port);
         check(reopened.configure(directory)["type"] == "workspace_ready" && read_text(directory / "src/main.cpp") == good_source,
               "disconnect releases directory lock and retains generated code");
+    }
+    {
+        Connection generic(port);
+        auto directory = root / "generic workspace";
+        check(generic.configure(directory)["type"] == "workspace_ready", "generic work directory accepted");
+        generic.ask("GENERIC"); auto result = generic.collect();
+        bool executed = false;
+        for (const auto& event : result) if (event.value("type", "") == "tool_result" && event.value("name", "") == "Bash") {
+            check(event["result"]["ok"], "generic command succeeds");
+            executed = executed || event["result"]["output"] == "updated shell\n";
+        }
+        check(result.back()["status"] == "success" && executed && !fs::exists(directory / "Makefile") &&
+              !fs::exists(directory / "src") && read_text(directory / "main.sh").find("updated shell") != std::string::npos,
+              "Glob, Write, Bash and Edit work without a C++ template or fixed test contract");
     }
     {
         Connection usage(port); usage.ask("USAGE"); auto events = usage.collect();
@@ -727,19 +823,35 @@ static void integration_tests(const std::string& binary, const fs::path& root) {
     auto file_b = fs::path(b.hello["workspace"].get<std::string>()) / "src/main.cpp";
     check(!fs::exists(file_a) && !fs::exists(file_b), "new sessions start without application sources");
     a.ask("GENERATE"); auto edited = a.collect();
-    check(edited.back()["status"] == "success" && edited.back()["tests_passed"], "full native tool loop succeeds");
+    check(edited.back()["status"] == "success" && !edited.back().contains("tests_passed") &&
+          !edited.back().contains("unverified_changes"), "native tool loop succeeds without inferred test state");
     check(read_text(file_a) == good_source && !fs::exists(file_b), "generated code workspace isolation");
-    check(fs::exists(file_a.parent_path().parent_path().parent_path() / "build-1.log"), "per-session build log exists");
+    check(fs::exists(file_a.parent_path().parent_path().parent_path() / "command-1.log"), "per-session command log exists");
     a.ask("EXTEND"); auto extended = a.collect();
     check(extended.back()["status"] == "success" && read_text(file_a) == extended_source && !fs::exists(file_b),
           "same connection extends the generated program without affecting B");
     {
         Connection over_count(port); over_count.ask("GENERATE_OVER_COUNT"); auto result = over_count.collect();
-        check(result.back()["status"] == "success" && result.back()["tests_passed"], "verified code can finish without over-budget model summary");
+        check(result.back()["status"] == "context_limit" && answer(result).find("代码已修改，编译和测试通过") == std::string::npos,
+              "context limit is reported without fabricating a final answer after successful commands");
     }
     {
         Connection unverified(port); unverified.ask("UNVERIFIED"); auto result = unverified.collect();
-        check(result.back()["status"] == "failed" && result.back()["unverified_changes"], "model cannot fake success without tests");
+        check(result.back()["status"] == "success" && !result.back().contains("tests_passed") &&
+              answer(result).find("未运行测试") != std::string::npos, "model may finish without mandatory validation");
+    }
+    {
+        Connection continue_tools(port); continue_tools.ask("KEEP_EDITING"); auto result = continue_tools.collect();
+        auto file = fs::path(continue_tools.hello["workspace"].get<std::string>()) / "src/main.cpp";
+        check(result.back()["status"] == "success" && result.back()["rounds"] == 6 &&
+              read_text(file).find("std::stable_sort(") != std::string::npos, "successful Bash does not force the next round to summarize");
+    }
+    {
+        Connection command_failed(port); command_failed.ask("FAILED_COMMAND"); auto result = command_failed.collect();
+        bool reported = false;
+        for (const auto& event : result) if (event.value("type", "") == "tool_result")
+            reported = event["result"]["exit_code"] == 5 && !event["result"]["ok"];
+        check(result.back()["status"] == "success" && reported, "task completion and command exit code have separate meanings");
     }
     {
         Connection cut(port); auto file = fs::path(cut.hello["workspace"].get<std::string>()) / "src/main.cpp";
@@ -756,8 +868,8 @@ static void integration_tests(const std::string& binary, const fs::path& root) {
         int limited_port;
         auto limited_server = start_server(binary, limited_port, model_port, root / "limited", 3);
         Connection limited(limited_port); limited.ask("GENERATE"); auto result = limited.collect();
-        check(result.back()["status"] == "success" && result.back()["tests_passed"] && result.back()["rounds"] == 3,
-              "tests passing on the final allowed round still succeed");
+        check(result.back()["status"] == "limit" && result.back()["rounds"] == 3,
+              "reaching the round limit after successful Bash still reports the limit");
     }
     {
         Connection disconnect(port), survive(port);

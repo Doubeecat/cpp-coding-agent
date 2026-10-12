@@ -62,7 +62,7 @@ struct Config {
     fs::path project = fs::path(AGENT_PROJECT_DIR) / "templates/cpp";
     fs::path sessions = fs::path(AGENT_PROJECT_DIR) / "sessions";
     int context = 8192, input_limit = 5632, output_limit = 2048;
-    int max_rounds = 8, model_timeout = 180, task_timeout = 480, build_timeout = 30;
+    int max_rounds = 8, model_timeout = 180, task_timeout = 480, command_timeout = 30;
     int max_clients = 8;
 };
 
@@ -96,12 +96,11 @@ public:
 Json tool_schema();
 class Tools {
     fs::path root_, logs_;
-    int timeout_, builds_ = 0;
-    fs::path checked_path(const std::string& path, bool write) const;
-    Json build(const Emit& emit, const Cancel& cancel);
+    int timeout_, commands_ = 0;
+    fs::path checked_path(const std::string& path) const;
+    void write_file(const fs::path& path, const std::string& content) const;
+    Json bash(const Json& args, const Emit& emit, const Cancel& cancel);
 public:
-    bool dirty = false;
-    bool tests_passed = false;
     Tools(fs::path workspace, fs::path logs, int timeout);
     Json execute(const std::string& name, const Json& args, const Emit& emit, const Cancel& cancel);
 };
@@ -110,7 +109,7 @@ struct Workspace {
     fs::path root;
     Fd lock;
 };
-Workspace open_workspace(const fs::path& path, const Config& config);
+Workspace open_workspace(const fs::path& path);
 std::string system_prompt();
 void run_session(int socket, const Config& config, const std::string& session_id);
 } // namespace ca

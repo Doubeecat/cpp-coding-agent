@@ -10,7 +10,7 @@
 
 static void help() {
     std::cout << "agent-server [--host 127.0.0.1] [--port 8888] [--model-url http://127.0.0.1:8080]\n"
-              << "  [--project DIR] [--sessions DIR] [--max-rounds 8] [--build-timeout 30]\n"
+              << "  [--project DIR] [--sessions DIR] [--max-rounds 8] [--command-timeout 30]\n"
               << "  [--model-timeout 180] [--task-timeout 480] [--input-limit 5632]\n"
               << "  [--max-tokens 2048] [--context 8192] [--max-clients 8]\n";
 }
@@ -29,7 +29,7 @@ int main(int argc, char** argv) {
             else if (key == "--project") config.project = value;
             else if (key == "--sessions") config.sessions = value;
             else if (key == "--max-rounds") config.max_rounds = std::stoi(value);
-            else if (key == "--build-timeout") config.build_timeout = std::stoi(value);
+            else if (key == "--command-timeout" || key == "--build-timeout") config.command_timeout = std::stoi(value);
             else if (key == "--model-timeout") config.model_timeout = std::stoi(value);
             else if (key == "--task-timeout") config.task_timeout = std::stoi(value);
             else if (key == "--input-limit") config.input_limit = std::stoi(value);
@@ -41,12 +41,11 @@ int main(int argc, char** argv) {
         if (config.port < 0 || config.port > 65535 || config.max_rounds < 1 || config.max_rounds > 32 ||
             config.max_clients < 1 || config.max_clients > 64 || config.context < 1024 || config.context > 16384 ||
             config.input_limit < 1 || config.output_limit < 1 || config.input_limit + config.output_limit + 512 > config.context ||
-            config.build_timeout < 1 || config.build_timeout > 300 || config.model_timeout < 1 || config.model_timeout > 600 ||
+            config.command_timeout < 1 || config.command_timeout > 300 || config.model_timeout < 1 || config.model_timeout > 600 ||
             config.task_timeout < 1 || config.task_timeout > 1800)
             throw std::runtime_error("参数范围非法或上下文预算不足");
         config.project = fs::canonical(config.project);
-        if (!fs::is_regular_file(config.project / "Makefile") || !fs::is_directory(config.project / "src"))
-            throw std::runtime_error("项目模板需要 Makefile 和 src/");
+        if (!fs::is_directory(config.project)) throw std::runtime_error("项目模板必须为目录");
         config.sessions = fs::absolute(config.sessions).lexically_normal();
         umask(0077);
         fs::create_directories(config.sessions);
