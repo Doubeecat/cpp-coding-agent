@@ -4,3 +4,5 @@ runtime/
 *.pid
 *.log
 .DS_Store
+tmp/
+output/

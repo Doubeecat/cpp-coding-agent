@@ -10,9 +10,9 @@
 
 static void help() {
     std::cout << "agent-server [--host 127.0.0.1] [--port 8888] [--model-url http://127.0.0.1:8080]\n"
-              << "  [--project DIR] [--sessions DIR] [--max-rounds 8] [--command-timeout 30]\n"
-              << "  [--model-timeout 180] [--task-timeout 480] [--input-limit 5632]\n"
-              << "  [--max-tokens 2048] [--context 8192] [--max-clients 8]\n";
+              << "  [--project DIR] [--sessions DIR] [--max-rounds 24] [--command-timeout 30]\n"
+              << "  [--model-timeout 180] [--task-timeout 900] [--input-limit 24576]\n"
+              << "  [--max-tokens 7680] [--context 32768] [--max-clients 8]\n";
 }
 int main(int argc, char** argv) {
     using namespace ca;
@@ -38,8 +38,8 @@ int main(int argc, char** argv) {
             else if (key == "--max-clients") config.max_clients = std::stoi(value);
             else throw std::runtime_error("未知参数：" + key);
         }
-        if (config.port < 0 || config.port > 65535 || config.max_rounds < 1 || config.max_rounds > 32 ||
-            config.max_clients < 1 || config.max_clients > 64 || config.context < 1024 || config.context > 16384 ||
+        if (config.port < 0 || config.port > 65535 || config.max_rounds < 1 || config.max_rounds > 64 ||
+            config.max_clients < 1 || config.max_clients > 64 || config.context < 1024 || config.context > 65536 ||
             config.input_limit < 1 || config.output_limit < 1 || config.input_limit + config.output_limit + 512 > config.context ||
             config.command_timeout < 1 || config.command_timeout > 300 || config.model_timeout < 1 || config.model_timeout > 600 ||
             config.task_timeout < 1 || config.task_timeout > 1800)

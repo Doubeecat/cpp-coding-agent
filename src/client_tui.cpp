@@ -29,12 +29,34 @@ double UiState::elapsed_seconds() const {
 }
 void UiState::apply(const Json &event) {
     auto type = event.value("type", "");
-    if (type == "hello" || type == "workspace_ready") {
+    if (type == "hello" || type == "workspace_ready" || type == "session_ready") {
         workspace = event.value("workspace", workspace);
         model = event.value("model", model);
         session = event.value("session_id", session);
         context = event.value("context", context);
         input_limit = event.value("input_limit", input_limit);
+        if (type == "session_ready") {
+            entries.push_back({UiEntry::Notice, "已恢复会话 " + session + "，共 " +
+                std::to_string(event.value("messages", 0)) + " 条消息"});
+            if (event.contains("warning")) entries.push_back({UiEntry::Notice, event["warning"].get<std::string>()});
+        }
+    } else if (type == "session_list") {
+        const auto &sessions = event.at("sessions");
+        entries.push_back({UiEntry::Notice, sessions.empty() ? std::string("当前没有可恢复的会话")
+                                                             : "共 " + std::to_string(sessions.size()) + " 个会话"});
+        for (const auto &item : sessions) {
+            std::string id = item.value("session_id", "");
+            // workspace 可能为 null（会话没有目录记录），只有字符串才当作路径。
+            std::string when = item.contains("modified") && item["modified"].is_string() ? item["modified"].get<std::string>() : std::string();
+            std::string where = item.contains("workspace") && item["workspace"].is_string() ? item["workspace"].get<std::string>() : std::string();
+            auto slash = where.find_last_of('/');
+            if (slash != std::string::npos) where = where.substr(slash + 1);
+            std::string line = (id == event.value("current", "") ? "* " : "  ") + id;
+            line += "  " + std::to_string(item.value("messages", 0)) + " 条";
+            if (!when.empty()) line += "  " + when;
+            if (!where.empty()) line += "  " + where;
+            entries.push_back({UiEntry::Notice, std::move(line)});
+        }
     } else if (type == "context_usage") {
         tokens = event.value("context_tokens", event.value("input_tokens", tokens));
         context = event.value("context", context);
@@ -78,7 +100,7 @@ void UiState::apply(const Json &event) {
         entry.running = false;
         active_tool_ = -1;
         status = "思考中";
-    } else if (type == "error" || type == "workspace_error") {
+    } else if (type == "error" || type == "workspace_error" || type == "session_error") {
         entries.push_back({UiEntry::Notice, event.value("message", "未知错误")});
     } else if (type == "task_done") {
         if (busy) completed_seconds_ = elapsed_seconds();
@@ -376,7 +398,9 @@ int run_tui(int socket, const Json &hello) {
         pollfd net{socket, POLLIN, 0};
         if (connected && poll(&net, 1, 0) > 0) {
             connected = inbox.receive(socket, [&](const Json &event) {
-                if (event.value("request_id", "") != state.request_id)
+                // 会话与目录类事件不带 request_id，其余事件必须属于本轮任务。
+                std::string id = event.value("request_id", "");
+                if (!id.empty() && id != state.request_id)
                     throw std::runtime_error("服务端返回错误的 request_id");
                 state.apply(event);
             });
@@ -589,7 +613,35 @@ int run_tui(int socket, const Json &hello) {
                 hint = "本轮仍在进行，可以先输入，结束后再发送";
             else if (!connected)
                 hint = "连接已关闭，请重新启动客户端";
-            else if (!input.empty()) {
+            else if (input.rfind(L"/sessions", 0) == 0 || input.rfind(L"/resume", 0) == 0 || input.rfind(L"/dir", 0) == 0) {
+                std::string command = narrow(input), argument;
+                auto space = command.find(' ');
+                std::string name = space == std::string::npos ? command : command.substr(0, space);
+                if (space != std::string::npos) {
+                    argument = command.substr(space + 1);
+                    while (!argument.empty() && argument.front() == ' ') argument.erase(argument.begin());
+                }
+                if (name == "/sessions") {
+                    send_frame(socket, {{"type", "list_sessions"}});
+                    state.entries.push_back({UiEntry::Notice, "正在读取会话列表…"});
+                } else if (name == "/resume") {
+                    if (argument.empty()) hint = "用法：/resume <会话 ID>，先用 /sessions 查看";
+                    else {
+                        send_frame(socket, {{"type", "resume_session"}, {"session_id", argument}});
+                        state.entries.push_back({UiEntry::Notice, "正在恢复会话 " + argument + "…"});
+                    }
+                } else if (argument.empty()) hint = "当前目录：" + state.workspace;
+                else {
+                    fs::path target = fs::path(argument).is_absolute()
+                                          ? fs::path(argument)
+                                          : fs::path(state.workspace) / fs::path(argument);
+                    send_frame(socket, {{"type", "set_workspace"}, {"workspace", fs::absolute(target).lexically_normal().string()}});
+                    state.entries.push_back({UiEntry::Notice, "正在切换目录…"});
+                }
+                input.clear();
+                cursor = 0; editor_top = 0; ensure_cursor = true;
+                following = true;
+            } else if (!input.empty()) {
                 auto text = narrow(input);
                 if (text.size() > 64 * 1024) {
                     hint = "输入超过 64 KiB";

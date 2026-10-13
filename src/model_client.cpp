@@ -99,7 +99,7 @@ void ModelClient::check_capacity(const Cancel& cancel) {
         throw std::runtime_error("模型至少需要两个并行槽，请使用 scripts/start-model.sh 启动");
     for (const auto& slot : slots) {
         if (slot.value("n_ctx", 0) < config_.context)
-            throw std::runtime_error("模型单槽上下文不足，请检查 --ctx-size 16384 --parallel 2");
+            throw std::runtime_error("模型单槽上下文不足，请检查 --ctx-size 65536 --parallel 2");
     }
 }
 int ModelClient::count_tokens(const Json& body, const Cancel& cancel) {

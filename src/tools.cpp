@@ -1,10 +1,14 @@
 #include "common.hpp"
 #include <cerrno>
 #include <cmath>
+#include <ctime>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <iomanip>
+#include <iostream>
 #include <limits>
 #include <poll.h>
+#include <set>
 #include <sstream>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -77,6 +81,101 @@ Workspace open_workspace(const fs::path& path) {
 }
 Tools::Tools(fs::path workspace, fs::path logs, int timeout)
     : root_(fs::canonical(workspace)), logs_(std::move(logs)), timeout_(timeout) {}
+void SessionSnapshot::load(const fs::path& root) {
+    workspace.clear();
+    messages = 0;
+    history = Json::array();
+    std::error_code error;
+    if (fs::exists(root / workspace_marker, error)) {
+        std::ifstream marker(root / workspace_marker);
+        std::string path;
+        if (std::getline(marker, path) && !path.empty()) workspace = fs::path(path);
+    }
+    std::ifstream transcript(root / "history.jsonl");
+    if (!transcript) throw std::runtime_error("会话缺少 history.jsonl，无法恢复");
+    std::string line;
+    while (std::getline(transcript, line)) {
+        if (line.empty()) continue;
+        Json item;
+        try { item = Json::parse(line); }
+        catch (const Json::exception&) { continue; }        // 跳过写入过程中留下的残行
+        if (!item.contains("message") || !item["message"].is_object()) continue;
+        const Json& message = item["message"];
+        std::string role = message.value("role", "");
+        if (role == "system" || role == "user" || role == "assistant" || role == "tool") {
+            history.push_back(message);
+            ++messages;
+        }
+    }
+    // 中断的任务可能留下没有结果的工具请求，恢复前补齐，避免发送给模型时报错。
+    std::set<std::string> answered;
+    for (const auto& message : history)
+        if (message.value("role", "") == "tool" && message.contains("tool_call_id"))
+            answered.insert(message["tool_call_id"].get<std::string>());
+    Json repaired = Json::array();
+    for (const auto& message : history) {
+        repaired.push_back(message);
+        if (message.value("role", "") != "assistant" || !message.contains("tool_calls")) continue;
+        for (const auto& call : message["tool_calls"]) {
+            std::string id = call.value("id", "");
+            if (id.empty() || answered.count(id)) continue;
+            repaired.push_back({{"role", "tool"}, {"tool_call_id", id},
+                                {"content", Json{{"ok", false}, {"error", "会话中断，工具未执行"}}.dump()}});
+            ++messages;
+        }
+    }
+    history = std::move(repaired);
+}
+void SessionSnapshot::save_workspace(const fs::path& session_root, const fs::path& workspace) const {
+    auto target = session_root / workspace_marker;
+    auto text = fs::canonical(workspace).string() + "\n";
+    auto temporary = target.string() + ".tmp-" + std::to_string(getpid());
+    { std::ofstream marker(temporary, std::ios::trunc); if (marker) marker << text; }
+    std::error_code error;
+    fs::rename(temporary, target, error);
+    if (error) fs::remove(temporary, error);
+}
+bool SessionSnapshot::has_workspace(const fs::path& session_root) {
+    std::error_code error;
+    return fs::exists(session_root / workspace_marker, error);
+}
+Json list_sessions(const fs::path& sessions) {
+    Json result = Json::array();
+    std::error_code error;
+    if (!fs::is_directory(sessions, error)) return result;
+    for (const auto& entry : fs::directory_iterator(sessions, error)) {
+        if (!entry.is_directory()) continue;
+        std::string id = entry.path().filename().string();
+        if (id.empty() || id[0] == '.') continue;
+        SessionSnapshot snapshot;
+        try { snapshot.load(entry.path()); }
+        catch (const std::exception&) { continue; }
+        std::string modified;
+        std::error_code stamp_error;
+        auto stamp = fs::last_write_time(entry.path() / "history.jsonl", stamp_error);
+        if (!stamp_error) {
+            // 文件时间的起点与系统时间不同，先算"距今多少秒"再换算成绝对时间。
+            auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                fs::file_time_type::clock::now() - stamp);
+            auto seconds = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now() - age);
+            std::tm value{};
+            gmtime_r(&seconds, &value);
+            std::ostringstream text;
+            text << std::put_time(&value, "%Y-%m-%d %H:%M:%S");
+            modified = text.str();
+        }
+        result.push_back({{"session_id", id},
+                          {"workspace", snapshot.workspace.empty() ? Json() : Json(snapshot.workspace.string())},
+                          {"messages", snapshot.messages},
+                          {"modified", modified.empty() ? Json() : Json(modified)},
+                          {"active", fs::exists(entry.path() / "events.jsonl")}});
+    }
+    std::sort(result.begin(), result.end(), [](const Json& left, const Json& right) {
+        return left.value("modified", "") > right.value("modified", "");
+    });
+    if (result.size() > 200) result.erase(result.begin() + 200, result.end());
+    return result;
+}
 fs::path Tools::checked_path(const std::string& value) const {
     if (value.empty() || value.find('\0') != std::string::npos) throw std::runtime_error("文件路径为空或包含 NUL");
     fs::path path(value);
@@ -128,6 +227,14 @@ static std::vector<std::string> path_parts(const fs::path& path) {
     std::vector<std::string> parts;
     for (const auto& part : path) if (part != ".") parts.push_back(part.string());
     return parts;
+}
+// lexically_relative(".") keeps a leading "./", so relative paths are rebuilt
+// from their components to keep one stable spelling for matching and output.
+static std::string relative_name(const fs::path& path) {
+    auto parts = path_parts(path);
+    std::string name;
+    for (const auto& part : parts) name += name.empty() ? part : "/" + part;
+    return name;
 }
 static bool glob_matches(const std::vector<std::string>& pattern, const fs::path& path) {
     auto parts = path_parts(path);
@@ -186,7 +293,7 @@ Json Tools::execute(const std::string& name, const Json& args, const Emit& emit,
                 }
                 if (it->is_symlink()) continue;
                 if (it->is_regular_file() && glob_matches(parts, it->path().lexically_relative(base))) {
-                    auto relative = it->path().lexically_relative(root_).generic_string();
+                    auto relative = relative_name(it->path().lexically_relative(root_));
                     bytes += Json(relative).dump().size() + 1;
                     if (files.size() == 100 || bytes > 4096) { truncated = true; break; }
                     files.push_back(relative);

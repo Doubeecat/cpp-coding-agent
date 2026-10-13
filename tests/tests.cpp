@@ -138,14 +138,14 @@ static void protocol_tests() {
 }
 static void ui_tests() {
     UiState ui;
-    ui.apply({{"type", "hello"}, {"workspace", "/tmp/我的项目"}, {"model", "qwen3.5-4b"}, {"context", 8192}});
+    ui.apply({{"type", "hello"}, {"workspace", "/tmp/我的项目"}, {"model", "qwen3.5-4b"}, {"context", 32768}});
     check(ui.tokens == -1 && ui.workspace == "/tmp/我的项目" && ui.model == "qwen3.5-4b", "footer metadata comes from server, no invented token count");
     ui.ask("生成代码", "1");
     check(ui.status == "思考中", "waiting phase is visible immediately after sending a prompt");
     usleep(20000);
     check(ui.elapsed_seconds() >= 0.01, "thinking timer advances without model events");
-    ui.apply({{"type", "context_usage"}, {"context_tokens", 1234}, {"input_tokens", 1200}, {"context", 8192}});
-    check(ui.tokens == 1234 && ui.context == 8192, "footer uses full measured context count");
+    ui.apply({{"type", "context_usage"}, {"context_tokens", 1234}, {"input_tokens", 1200}, {"context", 32768}});
+    check(ui.tokens == 1234 && ui.context == 32768, "footer uses full measured context count");
     const std::string source = "// 完整源码\nint main() { return 0; }\n";
     ui.apply({{"type", "tool_start"}, {"name", "Write"}, {"args", {{"file_path", "src/main.cpp"}, {"content", source}}}});
     int write = static_cast<int>(ui.entries.size()) - 1;
@@ -231,7 +231,7 @@ static void tui_terminal_tests(const std::string& binary, const fs::path& temp) 
     pollfd ready{listener.get(), POLLIN, 0};
     check(poll(&ready, 1, 5000) > 0, "interactive client connects");
     Fd connection(accept(listener.get(), nullptr, nullptr)); set_fd_flags(connection.get());
-    send_frame(connection.get(), {{"type", "hello"}, {"workspace", "/tmp/default"}, {"model", "qwen3.5-4b"}, {"context", 8192}, {"session_id", "pty-test"}});
+    send_frame(connection.get(), {{"type", "hello"}, {"workspace", "/tmp/default"}, {"model", "qwen3.5-4b"}, {"context", 32768}, {"session_id", "pty-test"}});
     auto configure = receive_frame(connection.get(), 5000);
     check(configure && configure->value("type", "") == "set_workspace" && configure->at("workspace") == directory,
           "CLI configures selected work directory before any user message");
@@ -283,7 +283,7 @@ static void tui_terminal_tests(const std::string& binary, const fs::path& temp) 
         keys(reports);
     };
     check(capture([&] { return screen.find("Token") != std::string::npos && screen.find("qwen3.5-4b") != std::string::npos; }), "pinned footer renders model and token limit");
-    check(screen.find(directory) != std::string::npos && screen.find("8192") != std::string::npos, "footer renders selected Unicode directory and per-slot capacity");
+    check(screen.find(directory) != std::string::npos && screen.find("32768") != std::string::npos, "footer renders selected Unicode directory and per-slot capacity");
     std::string long_prompt = "PROMPT_BEGIN_5861\n" + std::string(240, 'a') + "中文需求\n" +
                               std::string(150, 'b') + "\nPROMPT_END_9786";
     keys("\x1b[200~" + long_prompt + "\x1b[201~");
@@ -302,7 +302,7 @@ static void tui_terminal_tests(const std::string& binary, const fs::path& temp) 
     check(capture([&] { return screen.find("思考中") != std::string::npos; }), "thinking status appears before the first model event");
     auto id = question->at("request_id");
     auto event = [&](Json value) { value["request_id"] = id; send_frame(connection.get(), value); };
-    event({{"type", "context_usage"}, {"context_tokens", 1234}, {"context", 8192}});
+    event({{"type", "context_usage"}, {"context_tokens", 1234}, {"context", 32768}});
     event({{"type", "text_delta"}, {"text", "CHAT_STREAM_ONE"}});
     event({{"type", "tool_start"}, {"name", "Write"}, {"args", {{"file_path", "src/main.cpp"}, {"content", "CODE_MARKER_4862\nint main() {}"}}}});
     event({{"type", "tool_result"}, {"result", {{"ok", true}, {"bytes", 40}}}});
@@ -630,7 +630,7 @@ static void tool_reply(int fd, const std::string& name, const Json& args, bool t
 static void mock_connection(int fd, const fs::path& logs) {
     auto request = read_http(fd);
     if (request.path == "/props") { json_response(fd, {{"total_slots", 2}}); return; }
-    if (request.path == "/slots") { json_response(fd, Json::array({{{"n_ctx", 8192}}, {{"n_ctx", 8192}}})); return; }
+    if (request.path == "/slots") { json_response(fd, Json::array({{{"n_ctx", 32768}}, {{"n_ctx", 32768}}})); return; }
     check(request.body.contains("tools") && request.body.contains("messages"), "full messages and tools sent");
     const auto& messages = request.body.at("messages");
     std::size_t last_user = 0;
@@ -639,7 +639,7 @@ static void mock_connection(int fd, const fs::path& logs) {
     if (request.path == "/v1/chat/completions/input_tokens") {
         int completed = 0;
         for (std::size_t i = last_user + 1; i < messages.size(); ++i) if (messages[i].value("role", "") == "tool") ++completed;
-        json_response(fd, {{"input_tokens", prompt == "COUNT_OVER" || (prompt == "GENERATE_OVER_COUNT" && completed >= 3) ? 9000 : 512}});
+        json_response(fd, {{"input_tokens", prompt == "COUNT_OVER" || (prompt == "GENERATE_OVER_COUNT" && completed >= 3) ? 30000 : 512}});
         return;
     }
     check(request.body.value("tool_choice", "") == "auto", "model remains free to call tools after successful commands");
@@ -777,6 +777,64 @@ static void integration_tests(const std::string& binary, const fs::path& root) {
         Connection reopened(port);
         check(reopened.configure(directory)["type"] == "workspace_ready" && read_text(directory / "src/main.cpp") == good_source,
               "disconnect releases directory lock and retains generated code");
+    }
+    {
+        // 会话列表、会话恢复，以及恢复之后的工作目录切换。
+        std::string first;
+        {
+            Connection origin(port);
+            first = origin.hello["session_id"].get<std::string>();
+            origin.ask("REMEMBER 会话标记-A"); auto result = origin.collect();
+            check(result.back()["status"] == "success" && answer(result).find("会话标记-A") != std::string::npos,
+                  "session records a first task before it is resumed");
+        }
+        Connection back(port);
+        check(back.hello["session_id"].get<std::string>() != first, "new connection starts a new session");
+        send_frame(back.socket.get(), {{"type", "list_sessions"}});
+        auto listing = receive_frame(back.socket.get(), 5000);
+        check(listing && listing->value("type", "") == "session_list" && listing->at("sessions").is_array(),
+              "session list requested over the connection");
+        bool found = false;
+        for (const auto& item : listing->at("sessions"))
+            if (item.value("session_id", "") == first) {
+                found = true;
+                check(item.value("messages", 0) >= 3 && !item.value("workspace", "").empty() && !item.value("modified", "").empty(),
+                      "listed session reports messages, workspace and modification time");
+            }
+        check(found && listing->value("current", "") == back.hello["session_id"].get<std::string>(),
+              "listed sessions include the earlier one and mark the current session");
+        back.ask("RECALL");
+        auto stale = back.collect();
+        check(answer(stale).find("会话标记-A") == std::string::npos, "a fresh connection does not inherit the earlier session");
+        send_frame(back.socket.get(), {{"type", "resume_session"}, {"session_id", first}});
+        auto ready = receive_frame(back.socket.get(), 5000);
+        check(ready && ready->value("type", "") == "session_ready" && ready->value("session_id", "") == first &&
+              ready->value("messages", 0) >= 3,
+              "resume loads the saved session on the same connection");
+        back.ask("RECALL");
+        auto recalled = back.collect();
+        check(answer(recalled).find("会话标记-A") != std::string::npos,
+              "resumed history is sent back to the model");
+        send_frame(back.socket.get(), {{"type", "list_sessions"}});
+        auto after = receive_frame(back.socket.get(), 5000);
+        check(after && after->value("current", "") == first, "session list follows the active session after resume");
+        // 恢复之后允许在会话内切换工作目录。
+        auto elsewhere = root / "resumed elsewhere";
+        send_frame(back.socket.get(), {{"type", "set_workspace"}, {"workspace", elsewhere.string()}});
+        auto switched = receive_frame(back.socket.get(), 5000);
+        check(switched && switched->value("type", "") == "workspace_ready" &&
+              switched->value("session_id", "") == first && fs::path(switched->at("workspace").get<std::string>()) == fs::canonical(elsewhere),
+              "resumed session can change its work directory without losing its identity");
+        auto sessions_root = fs::path(back.hello["logs"].get<std::string>()).parent_path();
+        std::string marker = read_text(sessions_root / first / ".workspace");
+        check(marker.find("resumed elsewhere") != std::string::npos,
+              "work directory marker follows an in-session switch");
+        send_frame(back.socket.get(), {{"type", "resume_session"}, {"session_id", "123456-99999999999999"}});
+        auto missing = receive_frame(back.socket.get(), 5000);
+        check(missing && missing->value("type", "") == "session_error", "resuming an unknown session is reported");
+        send_frame(back.socket.get(), {{"type", "resume_session"}, {"session_id", first}});
+        auto current = receive_frame(back.socket.get(), 5000);
+        check(current && current->value("type", "") == "session_error", "resuming the active session is rejected");
     }
     {
         Connection generic(port);

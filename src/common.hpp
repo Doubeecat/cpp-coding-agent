@@ -61,8 +61,8 @@ struct Config {
     std::string model = "qwen3.5-4b";
     fs::path project = fs::path(AGENT_PROJECT_DIR) / "templates/cpp";
     fs::path sessions = fs::path(AGENT_PROJECT_DIR) / "sessions";
-    int context = 8192, input_limit = 5632, output_limit = 2048;
-    int max_rounds = 8, model_timeout = 180, task_timeout = 480, command_timeout = 30;
+    int context = 32768, input_limit = 24576, output_limit = 7680;
+    int max_rounds = 24, model_timeout = 180, task_timeout = 900, command_timeout = 30;
     int max_clients = 8;
 };
 
@@ -94,6 +94,17 @@ public:
 };
 
 Json tool_schema();
+// 会话目录中的工作目录标记，记录该会话实际使用的项目路径。
+constexpr const char* workspace_marker = ".workspace";
+struct SessionSnapshot {
+    fs::path workspace;             // 标记文件记录的项目目录，空表示没有记录
+    int messages = 0;               // history.jsonl 中恢复出的消息条数
+    Json history = Json::array();   // 校验并清理后的历史
+    void load(const fs::path& root);
+    void save_workspace(const fs::path& session_root, const fs::path& workspace) const;
+    static bool has_workspace(const fs::path& session_root);
+};
+Json list_sessions(const fs::path& sessions);
 class Tools {
     fs::path root_, logs_;
     int timeout_, commands_ = 0;

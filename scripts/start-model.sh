@@ -11,7 +11,7 @@ if [[ "$(uname -s)" == Darwin ]]; then
 fi
 exec "$server_bin" --model "$model_file" --alias qwen3.5-4b \
   --host 127.0.0.1 --port "${MODEL_PORT:-8080}" --cors-origins localhost \
-  "${device_args[@]}" --ctx-size 16384 --parallel 2 --no-kv-unified \
+  "${device_args[@]}" --ctx-size "${MODEL_CTX:-65536}" --parallel 2 --no-kv-unified \
   --flash-attn on --cache-type-k f16 --cache-type-v f16 \
   --jinja --reasoning off --no-context-shift --slots \
   --temp 0.2 --top-p 0.8 --top-k 20 --min-p 0 --repeat-penalty 1 \

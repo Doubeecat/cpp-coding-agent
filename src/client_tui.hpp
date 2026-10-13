@@ -17,7 +17,7 @@ class UiState {
 public:
     std::vector<UiEntry> entries;
     std::string workspace, model, session, request_id, status = "就绪";
-    int context = 8192, tokens = -1, input_limit = 5632, exit_code = 0;
+    int context = 32768, tokens = -1, input_limit = 24576, exit_code = 0;
     bool busy = false;
     void apply(const Json& event);
     void ask(const std::string& text, const std::string& id);
