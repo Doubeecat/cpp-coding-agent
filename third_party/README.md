@@ -1,7 +1,5 @@
-nlohmann/json 3.11.3, single header, MIT license (see nlohmann/LICENSE.MIT).
+# Dependencies
 
-Upstream: https://github.com/nlohmann/json/tree/v3.11.3
-
-json.hpp SHA-256: `9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6`
-
-The header is vendored so normal builds do not download dependencies. libcurl is supplied by the system.
+- yyjson **0.13.0**, ANSI C, MIT license. Vendored from https://github.com/ibireme/yyjson/tree/0.13.0; source checksums are in `yyjson/SHA256SUMS`, license in `yyjson/LICENSE`.
+- libcurl and ncurses are supplied by the system. Normal application builds do not download dependencies.
+- llama-server is an independent external process and is not linked into the C application.

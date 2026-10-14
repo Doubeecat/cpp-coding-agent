@@ -6,3 +6,7 @@ runtime/
 .DS_Store
 tmp/
 output/
+
+.coding-agent.lock
+.session.lock
+test/build/

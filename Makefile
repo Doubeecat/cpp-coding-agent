@@ -1,5 +1,5 @@
 # 顶层构建入口：把 CMake 构建、CTest、模型服务和客户端包成简单目标。
-# 依赖：CMake、C++17 编译器、libcurl、ncurses、llama-server 和本机 Qwen3.5-4B-Q8_0 权重。
+# 依赖：CMake、C11 编译器、libcurl、ncurses、llama-server 和本机 Qwen3.5-4B-Q8_0 权重。
 BUILD_DIR ?= build
 BUILD_TYPE ?= Release
 JOBS ?= 4
@@ -18,7 +18,7 @@ build:
 	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE)
 	cmake --build $(BUILD_DIR) -j $(JOBS)
 
-## 运行完整 CTest（使用 C++ 模拟模型，不需要启动模型服务）
+## 运行完整 CTest（使用 C 模拟模型，不需要启动模型服务）
 test: build
 	ctest --test-dir $(BUILD_DIR) --output-on-failure
 
