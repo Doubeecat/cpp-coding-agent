@@ -41,7 +41,7 @@ cmake --build build-c-sanitize -j 4
 ctest --test-dir build-c-sanitize --output-on-failure
 ```
 
-实际验证结果见 [TESTING.md](TESTING.md)，迁移范围与顺序见 [PLAN.md](PLAN.md)。
+简短工作汇总见 [WORK_SUMMARY.md](WORK_SUMMARY.md)，实际验证结果见 [TESTING.md](TESTING.md)，迁移范围与顺序见 [PLAN.md](PLAN.md)。
 
 ## 启动
 
